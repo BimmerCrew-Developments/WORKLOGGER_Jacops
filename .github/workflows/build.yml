@@ -39,11 +39,11 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: MyApp-${{ matrix.os }}
+          name: Worklogger-${{ matrix.os }}
           path: dist/*
 
   release:
-    if: startsWith(github.ref, 'refs/tags/')
+    if: startsWith(github.ref, 'refs/tags/v*')
     needs: build
     runs-on: ubuntu-latest
 
