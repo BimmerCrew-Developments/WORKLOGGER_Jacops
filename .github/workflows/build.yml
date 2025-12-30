@@ -34,7 +34,7 @@ jobs:
 
       - name: Build with PyInstaller
         run: |
-          pyinstaller --onefile --name MyApp main.py
+          pyinstaller --onefile --name MyApp ssv_zip_processor_gui_v22.py
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
