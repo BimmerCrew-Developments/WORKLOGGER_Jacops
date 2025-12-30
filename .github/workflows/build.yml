@@ -14,7 +14,7 @@ jobs:
     strategy:
       matrix:
         os: [windows-latest, macos-latest]
-        python-version: ["3.14"]
+        python-version: ["3.12"]
     runs-on: ${{ matrix.os }}
 
     steps:
@@ -54,10 +54,6 @@ jobs:
           path: artifacts
 
       - name: Create GitHub Release and upload files
-        uses: softprops/action-gh-release@v2
-        with:
-          files: artifacts/**/*
-
         uses: softprops/action-gh-release@v2
         with:
           files: artifacts/**/*
