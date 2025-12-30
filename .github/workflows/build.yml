@@ -2,6 +2,11 @@ name: Build executables
 
 on:
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Tag to upload assets to (example: v1.0.1). Leave empty to only build artifacts."
+        required: false
+        default: ""
   push:
     tags:
       - "v*"
@@ -14,7 +19,7 @@ jobs:
     strategy:
       matrix:
         os: [windows-latest, macos-latest]
-        python-version: ["3.12"]
+        python-version: ["3.11"]
     runs-on: ${{ matrix.os }}
 
     steps:
@@ -34,16 +39,21 @@ jobs:
 
       - name: Build with PyInstaller
         run: |
-          pyinstaller --onefile --windowed --name MyApp ssv_zip_processor_gui_v22.py
+          pyinstaller --onefile --windowed --name Worklogger ssv_zip_processor_gui_v22.py
+
+      - name: Verify dist output
+        run: |
+          ls -la dist
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: Worklogger-${{ matrix.os }}
           path: dist/*
+          if-no-files-found: error
 
   release:
-    if: startsWith(github.ref, 'refs/tags/v*')
+    if: startsWith(github.ref, 'refs/tags/') || github.event.inputs.release_tag != ''
     needs: build
     runs-on: ubuntu-latest
 
@@ -53,7 +63,8 @@ jobs:
         with:
           path: artifacts
 
-      - name: Create GitHub Release and upload files
+      - name: Create/Update GitHub Release and upload files
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ github.event.inputs.release_tag || github.ref_name }}
           files: artifacts/**/*
