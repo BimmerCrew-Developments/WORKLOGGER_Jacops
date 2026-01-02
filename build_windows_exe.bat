@@ -10,6 +10,7 @@ python -m pip install -r requirements_v22.txt pyinstaller
 pyinstaller ^
   --noconfirm ^
   --clean ^
+  --onefile ^
   --windowed ^
   --name WorkloggerProcessor ^
   ssv_zip_processor_gui_v22.py
