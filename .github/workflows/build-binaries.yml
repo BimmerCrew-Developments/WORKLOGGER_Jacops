@@ -24,13 +24,9 @@ jobs:
 
       - name: Build .exe
         shell: cmd
-        run: build_windows_exe.bat
-
-      - name: Zip Windows executable
-        shell: pwsh
         run: |
-          Compress-Archive -Path "dist/WorkloggerProcessor.exe" -DestinationPath "dist/WorkloggerProcessor-windows.zip" -Force
-          Get-ChildItem dist
+          build_windows_exe.bat
+          powershell -NoProfile -Command "Compress-Archive -Path 'dist\\WorkloggerProcessor.exe' -DestinationPath 'dist\\WorkloggerProcessor-windows.zip'"
 
       - name: Upload Windows artifact
         uses: actions/upload-artifact@v4
