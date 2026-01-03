@@ -24,37 +24,9 @@ jobs:
 
       - name: Build .exe
         shell: cmd
-        run: build_windows_exe.bat
-
-      - name: Verify .exe exists
-        shell: cmd
         run: |
-          if not exist dist\WorkloggerProcessor.exe (
-            echo dist\WorkloggerProcessor.exe was not created
-            dir /s dist
-            exit /b 1
-          )
-
-      - name: Debug dist contents
-        shell: cmd
-        run: |
-          echo Listing dist contents after build step:
-          dir /s dist
-
-      - name: Zip Windows executable
-        shell: pwsh
-        run: |
-          $exePath = Join-Path $PWD "dist/WorkloggerProcessor.exe"
-          if (-not (Test-Path $exePath)) {
-            Write-Host "dist directory listing (missing executable):"
-            Get-ChildItem -Path (Join-Path $PWD "dist") -Recurse
-            throw "WorkloggerProcessor.exe not found at $exePath"
-          }
-
-          $zipPath = Join-Path $PWD "dist/WorkloggerProcessor-windows.zip"
-          Compress-Archive -Path $exePath -DestinationPath $zipPath -Force
-          Write-Host "Created artifact: $zipPath"
-          Get-ChildItem -Path (Join-Path $PWD "dist")
+          build_windows_exe.bat
+          powershell -NoProfile -Command "Compress-Archive -Path 'dist\\WorkloggerProcessor.exe' -DestinationPath 'dist\\WorkloggerProcessor-windows.zip'"
 
       - name: Upload Windows artifact
         uses: actions/upload-artifact@v4
