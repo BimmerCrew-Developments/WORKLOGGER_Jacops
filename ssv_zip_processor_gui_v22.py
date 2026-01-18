@@ -11,7 +11,7 @@ Given a SafetyAuditor ZIP export that contains:
 
 This tool will:
   1) extract the ZIP to a temp folder
-  2) rename + compress all referenced JPEGs (<= 350 KB each) into the chosen output folder
+  2) rename all referenced JPEGs into the chosen output folder (original quality preserved)
   3) generate a "WERKLOGGER RAPPORT" style PDF in the same output folder, matching the provided
      reference layout (2 photos side-by-side per row; no approver signature).
 
@@ -19,7 +19,7 @@ Key rules
 ---------
 - Image naming comes from CSV Label, normalized to OS-safe filenames
 - Media IDs in CSV are semicolon-separated; extension is .jpeg
-- Images are compressed iteratively to <= 350 KB (no EXIF/metadata)
+- Images are kept at original quality (no recompression)
 - PDF sections "Gebruikte materialen" and "Post Afmeldingen" are populated from quantity rows in the CSV.
 """
 
@@ -124,7 +124,6 @@ class ProcessResult:
 # =========================
 # Utility helpers
 # =========================
-MAX_BYTES = 350 * 1024
 
 
 def normalize_label(label: str) -> str:
@@ -257,39 +256,6 @@ def fmt_epoch(value: str) -> str:
         return dt.datetime.fromtimestamp(n).strftime("%d/%m/%Y %H:%M")
     except Exception:
         return ""
-
-
-def compress_jpeg_to_limit(im: Image.Image, max_bytes: int = MAX_BYTES) -> bytes:
-    """Compress a PIL image to JPEG <= max_bytes by lowering quality."""
-    # We always store RGB, no metadata
-    if im.mode != "RGB":
-        im = im.convert("RGB")
-
-    # Start high, go down
-    for q in [90, 85, 80, 75, 70, 65, 60, 55, 50, 45, 40, 35, 30]:
-        buf = io.BytesIO()
-        im.save(buf, format="JPEG", quality=q, optimize=True)
-        data = buf.getvalue()
-        if len(data) <= max_bytes:
-            return data
-
-    # If still too big, attempt small downscale steps
-    w, h = im.size
-    for scale in [0.9, 0.8, 0.7]:
-        nw, nh = max(1, int(w * scale)), max(1, int(h * scale))
-        im2 = im.resize((nw, nh), Image.LANCZOS)
-        for q in [70, 60, 50, 40, 30]:
-            buf = io.BytesIO()
-            im2.save(buf, format="JPEG", quality=q, optimize=True)
-            data = buf.getvalue()
-            if len(data) <= max_bytes:
-                return data
-
-    # Last resort: return smallest we got
-    buf = io.BytesIO()
-    im.save(buf, format="JPEG", quality=25, optimize=True)
-    return buf.getvalue()
-
 
 
 
@@ -1373,10 +1339,7 @@ def process_zip_to_folder_and_pdf(zip_path: Path, out_dir: Path, project_overrid
                 used_names.add(out_name.lower())
 
                 out_path = out_dir / out_name
-                with Image.open(src) as im:
-                    im = ImageOps.exif_transpose(im).convert("RGB")
-                    data = compress_jpeg_to_limit(im, MAX_BYTES)
-                out_path.write_bytes(data)
+                shutil.copy2(src, out_path)
                 written += 1
                 processed_photos.append(Photo(label=mrow.label, image_path=out_path))
 

@@ -26,13 +26,18 @@ jobs:
         shell: cmd
         run: |
           build_windows_exe.bat
-          powershell -NoProfile -Command "Compress-Archive -Path 'dist\\WorkloggerProcessor.exe' -DestinationPath 'dist\\WorkloggerProcessor-windows.zip'"
+          if not exist dist\WorkloggerProcessor.exe exit /b 1
+
+      - name: Package Windows artifact
+        shell: pwsh
+        run: |
+          Compress-Archive -Path dist/WorkloggerProcessor.exe -DestinationPath WorkloggerProcessor-windows.zip -Force
 
       - name: Upload Windows artifact
         uses: actions/upload-artifact@v4
         with:
           name: worklogger-windows
-          path: dist/WorkloggerProcessor-windows.zip
+          path: WorkloggerProcessor-windows.zip
           if-no-files-found: error
 
   macos-build:
