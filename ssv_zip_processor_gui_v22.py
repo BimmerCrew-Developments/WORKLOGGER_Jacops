@@ -1091,13 +1091,17 @@ def render_page1(c: Canvas, report: ReportRow) -> None:
 
 
 
-def _fit_image_in_box(im: Image.Image, box_w: float, box_h: float) -> Image.Image:
-    """Return resized image that fits box while preserving aspect ratio."""
+def _fit_image_in_box(im: Image.Image, box_w: float, box_h: float, target_dpi: int = 200) -> Image.Image:
+    """Return image sized for a target DPI while preserving aspect ratio."""
     im = ImageOps.exif_transpose(im).convert("RGB")
     iw, ih = im.size
     if iw <= 0 or ih <= 0:
         return im
-    scale = min(box_w / iw, box_h / ih)
+    target_w_px = max(1, int((box_w / 72.0) * target_dpi))
+    target_h_px = max(1, int((box_h / 72.0) * target_dpi))
+    scale = min(target_w_px / iw, target_h_px / ih)
+    if scale >= 1.0:
+        return im
     nw, nh = max(1, int(iw * scale)), max(1, int(ih * scale))
     return im.resize((nw, nh), Image.LANCZOS)
 
@@ -1190,15 +1194,22 @@ def render_photos_pages(c: Canvas, report: ReportRow) -> None:
                     return
                 try:
                     with Image.open(photo.image_path) as im:
-                        im_fit = _fit_image_in_box(im, box_w, box_h)
+                        im_fit = _fit_image_in_box(im, box_w, box_h, target_dpi=200)
                         bio = io.BytesIO()
-                        im_fit.save(bio, format="JPEG", quality=90)
+                        im_fit.save(bio, format="JPEG", quality=95, subsampling=0)
                         bio.seek(0)
-                        iw, ih = im_fit.size
-                        # Convert pixels to points 1:1 approximation; we sized by points anyway
-                        dx = x0 + (box_w - iw) / 2.0
-                        dy = row_bottom + (box_h - ih) / 2.0
-                        c.drawImage(ImageReader(bio), dx, dy, width=iw, height=ih, preserveAspectRatio=True, mask='auto')
+                        dx = x0
+                        dy = row_bottom
+                        c.drawImage(
+                            ImageReader(bio),
+                            dx,
+                            dy,
+                            width=box_w,
+                            height=box_h,
+                            preserveAspectRatio=True,
+                            mask='auto',
+                            anchor='c',
+                        )
                 except Exception:
                     return
 
