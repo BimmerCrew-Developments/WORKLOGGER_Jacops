@@ -28,7 +28,6 @@ from __future__ import annotations
 import argparse
 import csv
 import datetime as dt
-import io
 import json
 import os
 import re
@@ -1091,21 +1090,6 @@ def render_page1(c: Canvas, report: ReportRow) -> None:
 
 
 
-def _fit_image_in_box(im: Image.Image, box_w: float, box_h: float, target_dpi: int = 200) -> Image.Image:
-    """Return image sized for a target DPI while preserving aspect ratio."""
-    im = ImageOps.exif_transpose(im).convert("RGB")
-    iw, ih = im.size
-    if iw <= 0 or ih <= 0:
-        return im
-    target_w_px = max(1, int((box_w / 72.0) * target_dpi))
-    target_h_px = max(1, int((box_h / 72.0) * target_dpi))
-    scale = min(target_w_px / iw, target_h_px / ih)
-    if scale >= 1.0:
-        return im
-    nw, nh = max(1, int(iw * scale)), max(1, int(ih * scale))
-    return im.resize((nw, nh), Image.LANCZOS)
-
-
 def render_photos_pages(c: Canvas, report: ReportRow) -> None:
     """Render photo pages matching the reference layout (2 columns, 3 rows per page)."""
     w, h = A4
@@ -1194,14 +1178,14 @@ def render_photos_pages(c: Canvas, report: ReportRow) -> None:
                     return
                 try:
                     with Image.open(photo.image_path) as im:
-                        im_fit = _fit_image_in_box(im, box_w, box_h, target_dpi=200)
-                        bio = io.BytesIO()
-                        im_fit.save(bio, format="JPEG", quality=95, subsampling=0)
-                        bio.seek(0)
+                        # Keep photo quality maximal in the PDF:
+                        # - do not downscale to a target DPI
+                        # - do not re-encode to JPEG (no extra lossy compression)
+                        im_oriented = ImageOps.exif_transpose(im).convert("RGB")
                         dx = x0
                         dy = row_bottom
                         c.drawImage(
-                            ImageReader(bio),
+                            ImageReader(im_oriented),
                             dx,
                             dy,
                             width=box_w,
