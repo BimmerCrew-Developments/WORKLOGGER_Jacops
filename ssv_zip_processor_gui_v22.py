@@ -38,7 +38,8 @@ import uuid
 import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional, Set, Tuple
+from string import Formatter
+from typing import Any, Callable, Dict, List, Mapping, Optional, Set, Tuple
 
 # GUI (optional at import time; required for desktop use)
 try:
@@ -113,6 +114,43 @@ class ReportRow:
 
 
 @dataclass(frozen=True)
+class ExportField:
+    """A value that templates are allowed to read from :class:`ReportRow`."""
+
+    display_name: str
+    getter: Callable[[ReportRow], Any]
+
+
+# This is the sole interface between untrusted presentation templates and imported
+# report data.  Keys are stable; Python attribute paths and expressions are never
+# accepted from a template file.
+EXPORT_FIELD_REGISTRY: Mapping[str, ExportField] = {
+    "report_datetime": ExportField("Report date and time", lambda row: row.report_datetime),
+    "subcontractor": ExportField("Subcontractor name", lambda row: row.naam_onderaannemer),
+    "project_name": ExportField("Project/location name", lambda row: row.project_locatie_naam),
+    "building_id": ExportField("Building ID", lambda row: row.building_id),
+    "address": ExportField("Address", lambda row: row.adres),
+    "postal_city": ExportField("Postal code and city", lambda row: row.postcode_stad),
+    "contact": ExportField("Contact person", lambda row: row.contactpersoon),
+    "quadrant": ExportField("Quadrant", lambda row: row.quadrant),
+    "duct_color": ExportField("Connected duct color", lambda row: row.duct_kleur),
+    "units_welded": ExportField("Units welded", lambda row: row.units_gelast),
+    "materials": ExportField("Materials used", lambda row: row.gebruikte_materialen_lines),
+    "post_registrations": ExportField("Post registrations", lambda row: row.post_afmeldingen_lines),
+    "photos": ExportField("Photos", lambda row: row.photos),
+}
+
+SECTION_FIELD_KEYS: Mapping[str, Tuple[str, ...]] = {
+    "address": ("subcontractor", "project_name", "building_id", "address", "postal_city", "contact", "quadrant"),
+    "lmra": (),
+    "work_details": ("duct_color", "units_welded"),
+    "materials": ("materials",),
+    "post_registrations": ("post_registrations",),
+    "photos": ("photos",),
+}
+
+
+@dataclass(frozen=True)
 class ExportTemplate:
     """Declarative PDF export layout.
 
@@ -128,9 +166,11 @@ class ExportTemplate:
     colors: Mapping[str, Tuple[float, float, float]]
     enabled_sections: Tuple[str, ...]
     section_order: Tuple[str, ...]
+    section_fields: Mapping[str, Tuple[str, ...]]
     field_labels: Mapping[str, str]
     photo_grid: Mapping[str, Any]
     output_filename_pattern: str
+    empty_value_fallback: str = "Niet ingevuld"
     layout: Mapping[str, Any] = field(default_factory=dict)
 
 
@@ -147,14 +187,13 @@ WERKLOGGER_EXPORT_TEMPLATE = ExportTemplate(
     },
     enabled_sections=("address", "lmra", "work_details", "materials", "post_registrations", "photos"),
     section_order=("address", "lmra", "work_details", "materials", "post_registrations", "photos"),
+    section_fields=SECTION_FIELD_KEYS,
     field_labels={
-        "address": "Adresgegevens:", "subcontractor": "Naam Onderaannemer:",
-        "project": "Project/Locatie Naam:", "building_id": "Building ID:",
-        "street_address": "Adres:", "postal_city": "Postcode + Stad:",
+        "subcontractor": "Naam Onderaannemer:",
+        "project_name": "Project/Locatie Naam:", "building_id": "Building ID:",
+        "address": "Adres:", "postal_city": "Postcode + Stad:",
         "contact": "Contactpersoon:", "quadrant": "Quadrant:",
-        "lmra": "LMRA Checklist:", "work_details": "Uitgevoerde Werken - Details:",
         "duct_color": "Gekoppelde kleur duct:", "units_welded": "Hoeveel units gelast:",
-        "materials": "Gebruikte materialen:", "post_registrations": "Post Afmeldingen:",
     },
     photo_grid={
         "columns": 2, "rows": 3, "left": 56.6929, "right": 538.5827,
@@ -177,6 +216,11 @@ TEMPLATE_SECTIONS = (
     ("work_details", "Work details"), ("materials", "Materials"),
     ("post_registrations", "Post registrations"), ("photos", "Photos"),
 )
+SECTION_TITLES = {
+    "address": "Adresgegevens:", "lmra": "LMRA Checklist:",
+    "work_details": "Uitgevoerde Werken - Details:",
+    "materials": "Gebruikte materialen:", "post_registrations": "Post Afmeldingen:",
+}
 FILENAME_PLACEHOLDERS = frozenset({"building_id", "project_name", "report_datetime"})
 
 
@@ -193,8 +237,10 @@ def export_template_to_dict(template: ExportTemplate) -> Dict[str, Any]:
         "page_settings": dict(template.page_settings), "branding": dict(template.branding),
         "colors": {key: list(value) for key, value in template.colors.items()},
         "enabled_sections": list(template.enabled_sections), "section_order": list(template.section_order),
+        "section_fields": {key: list(value) for key, value in template.section_fields.items()},
         "field_labels": dict(template.field_labels), "photo_grid": dict(template.photo_grid),
-        "output_filename_pattern": template.output_filename_pattern, "layout": dict(template.layout),
+        "output_filename_pattern": template.output_filename_pattern,
+        "empty_value_fallback": template.empty_value_fallback, "layout": dict(template.layout),
     }
 
 
@@ -205,8 +251,10 @@ def export_template_from_dict(data: Mapping[str, Any]) -> ExportTemplate:
         page_settings=dict(data["page_settings"]), branding=dict(data["branding"]),
         colors={key: tuple(value) for key, value in dict(data["colors"]).items()},
         enabled_sections=tuple(data["enabled_sections"]), section_order=tuple(data["section_order"]),
+        section_fields={str(k): tuple(v) for k, v in dict(data.get("section_fields", SECTION_FIELD_KEYS)).items()},
         field_labels={str(k): str(v) for k, v in dict(data["field_labels"]).items()},
         photo_grid=dict(data["photo_grid"]), output_filename_pattern=str(data["output_filename_pattern"]),
+        empty_value_fallback=str(data.get("empty_value_fallback", "Niet ingevuld")),
         layout=dict(data["layout"]),
     )
     if resolve_export_template(template) is not template:
@@ -221,12 +269,9 @@ def validate_template_values(name: str, title: str, pattern: str, colors: Mappin
     if not name.strip(): errors.append("Template name is required.")
     if not title.strip(): errors.append("Report title is required.")
     if not pattern.strip(): errors.append("Filename pattern is required.")
-    fields = re.findall(r"{([^{}!:]+)(?:![^{}:]*)?(?::[^{}]*)?}", pattern)
-    unknown = sorted(set(fields) - FILENAME_PLACEHOLDERS)
-    if unknown: errors.append("Unknown filename placeholder(s): " + ", ".join(unknown))
     try:
-        pattern.format(**{key: "value" for key in FILENAME_PLACEHOLDERS})
-    except (KeyError, ValueError, IndexError) as exc:
+        substitute_export_placeholders(pattern, {key: "value" for key in FILENAME_PLACEHOLDERS}, FILENAME_PLACEHOLDERS)
+    except ValueError as exc:
         errors.append(f"Invalid filename pattern: {exc}")
     if not sections: errors.append("Enable at least one section.")
     try:
@@ -236,6 +281,40 @@ def validate_template_values(name: str, title: str, pattern: str, colors: Mappin
         if not re.fullmatch(r"#[0-9a-fA-F]{6}", str(value).strip()):
             errors.append(f"Color {key} must use #RRGGBB format.")
     return errors
+
+
+def substitute_export_placeholders(pattern: str, values: Mapping[str, str], allowed: Set[str] | frozenset[str]) -> str:
+    """Substitute plain, allow-listed ``{key}`` placeholders only.
+
+    Format specifications, conversions, indexing, and attribute access are
+    deliberately rejected rather than delegated to ``str.format``.
+    """
+    output: List[str] = []
+    try:
+        parsed = Formatter().parse(pattern)
+        for literal, key, format_spec, conversion in parsed:
+            output.append(literal)
+            if key is None:
+                continue
+            if not key or key not in allowed:
+                raise ValueError(f"unknown placeholder: {key or '<empty>'}")
+            if format_spec or conversion:
+                raise ValueError(f"formatting is not allowed for placeholder: {key}")
+            output.append(str(values.get(key, "")))
+    except (KeyError, IndexError, ValueError) as exc:
+        raise ValueError(str(exc)) from exc
+    return "".join(output)
+
+
+def export_field_value(report: ReportRow, key: str, empty_fallback: str = "") -> Any:
+    """Read a registered report field and apply fallback to missing text values."""
+    try:
+        value = EXPORT_FIELD_REGISTRY[key].getter(report)
+    except KeyError as exc:
+        raise ValueError(f"Unknown export field: {key}") from exc
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return empty_fallback
+    return value
 
 
 def load_export_templates(path: Optional[Path] = None) -> List[ExportTemplate]:
@@ -255,6 +334,9 @@ def load_export_templates(path: Optional[Path] = None) -> List[ExportTemplate]:
 def save_export_templates(templates: List[ExportTemplate], path: Optional[Path] = None) -> None:
     """Atomically persist custom templates, never writing the built-in template."""
     destination = path or _template_store_path()
+    invalid = [template.template_id for template in templates if resolve_export_template(template) is not template]
+    if invalid:
+        raise ValueError("Refusing to save invalid template(s): " + ", ".join(invalid))
     destination.parent.mkdir(parents=True, exist_ok=True)
     payload = [export_template_to_dict(t) for t in templates
                if t.template_id != WERKLOGGER_EXPORT_TEMPLATE.template_id]
@@ -286,15 +368,25 @@ def resolve_export_template(template: Optional[ExportTemplate]) -> ExportTemplat
             and len(template.section_order) == len(set(template.section_order))
             and set(template.enabled_sections).issubset(set(template.section_order))
             and set(template.section_order).issubset(required_sections)
+            and set(template.section_fields) == required_sections
+            and all(set(keys).issubset(EXPORT_FIELD_REGISTRY) for keys in template.section_fields.values())
+            and all(tuple(template.section_fields[key]) == keys for key, keys in SECTION_FIELD_KEYS.items())
             and bool(template.page_settings.get("pagesize"))
             and "bottom_y" in template.page_settings
             and required_layout.issubset(template.layout)
-            and required_labels.issubset(template.field_labels)
+            and set(template.field_labels) == required_labels
+            and set(template.field_labels).issubset(EXPORT_FIELD_REGISTRY)
             and required_colors.issubset(template.colors)
             and required_grid.issubset(template.photo_grid)
             and int(template.photo_grid["columns"]) > 0
             and int(template.photo_grid["rows"]) > 0
         )
+        if valid:
+            substitute_export_placeholders(
+                template.output_filename_pattern,
+                {key: "value" for key in FILENAME_PLACEHOLDERS},
+                FILENAME_PLACEHOLDERS,
+            )
     except (AttributeError, TypeError, ValueError):
         valid = False
     return template if valid else WERKLOGGER_EXPORT_TEMPLATE
@@ -1056,6 +1148,7 @@ def render_page1(c: Canvas, report: ReportRow, template: Optional[ExportTemplate
     w, h = template.page_settings["pagesize"]
     layout = template.layout
     labels = template.field_labels
+    value = lambda key: export_field_value(report, key, template.empty_value_fallback)
     X_LEFT, X_RIGHT = layout["left"], layout["right"]
     RED, GOLD = template.colors["primary"], template.colors["secondary"]
     GREEN_BAR, YES_GREEN = template.colors["status_bar"], template.colors["status_yes"]
@@ -1074,7 +1167,7 @@ def render_page1(c: Canvas, report: ReportRow, template: Optional[ExportTemplate
 
     c.setFillColorRGB(1, 1, 1)
     c.setFont("Helvetica-Bold", 10)
-    c.drawRightString(X_RIGHT, layout["datetime_y"], report.report_datetime)
+    c.drawRightString(X_RIGHT, layout["datetime_y"], value("report_datetime"))
 
     dy = layout["line_spacing"]
 
@@ -1092,19 +1185,13 @@ def render_page1(c: Canvas, report: ReportRow, template: Optional[ExportTemplate
         # ======================
         # Adresgegevens
         # ======================
-        draw_section(labels["address"], y_title=739.78, line_y=731.34, color=RED)
+        draw_section(SECTION_TITLES["address"], y_title=739.78, line_y=731.34, color=RED)
 
         addr_x_val = layout["address_value_x"]
         y = 715.0956
 
         addr_items = [
-            (labels["subcontractor"], report.naam_onderaannemer),
-            (labels["project"], report.project_locatie_naam),
-            (labels["building_id"], report.building_id),
-            (labels["street_address"], report.adres),
-            (labels["postal_city"], report.postcode_stad),
-            (labels["contact"], report.contactpersoon),
-            (labels["quadrant"], report.quadrant),
+            (labels[key], value(key)) for key in template.section_fields["address"]
         ]
 
         for k, v in addr_items:
@@ -1118,7 +1205,7 @@ def render_page1(c: Canvas, report: ReportRow, template: Optional[ExportTemplate
         # ======================
         # LMRA Checklist
         # ======================
-        draw_section(labels["lmra"], y_title=581.04, line_y=572.60, color=RED)
+        draw_section(SECTION_TITLES["lmra"], y_title=581.04, line_y=572.60, color=RED)
 
         # Status bar
         bar_y0 = 538.5827
@@ -1157,13 +1244,12 @@ def render_page1(c: Canvas, report: ReportRow, template: Optional[ExportTemplate
         # ======================
         # Uitgevoerde Werken - Details
         # ======================
-        draw_section(labels["work_details"], y_title=405.29, line_y=396.85, color=RED)
+        draw_section(SECTION_TITLES["work_details"], y_title=405.29, line_y=396.85, color=RED)
 
         details_x_val = layout["details_value_x"]
         y = 380.6142
         details_items = [
-            (labels["duct_color"], report.duct_kleur),
-            (labels["units_welded"], report.units_gelast),
+            (labels[key], value(key)) for key in template.section_fields["work_details"]
         ]
         for k, v in details_items:
             c.setFont("Helvetica-Bold", 10)
@@ -1193,7 +1279,7 @@ def render_page1(c: Canvas, report: ReportRow, template: Optional[ExportTemplate
         c.setFont("Helvetica-Bold", 16)
         c.drawString(X_LEFT, layout["title_y"], template.branding["report_title"])
         c.setFont("Helvetica-Bold", 10)
-        c.drawRightString(X_RIGHT, layout["datetime_y"], report.report_datetime)
+        c.drawRightString(X_RIGHT, layout["datetime_y"], value("report_datetime"))
         c.setFillColorRGB(0, 0, 0)
 
     def draw_bullet_lines(lines: list[str], y_start: float) -> tuple[list[str], float]:
@@ -1216,11 +1302,13 @@ def render_page1(c: Canvas, report: ReportRow, template: Optional[ExportTemplate
         return remaining, y
 
     # Render materials across pages if needed
-    mat_lines = list(report.gebruikte_materialen_lines or ["-"])
-    work_lines = list(report.post_afmeldingen_lines or ["-"])
+    mat_value = value(template.section_fields["materials"][0])
+    work_value = value(template.section_fields["post_registrations"][0])
+    mat_lines = list(mat_value if isinstance(mat_value, list) else [mat_value])
+    work_lines = list(work_value if isinstance(work_value, list) else [work_value])
 
     on_first_page = True
-    mat_title = labels["materials"]
+    mat_title = SECTION_TITLES["materials"]
     mat_y_title = 334.43
     mat_y_text = 309.7402
 
@@ -1243,7 +1331,7 @@ def render_page1(c: Canvas, report: ReportRow, template: Optional[ExportTemplate
         mat_lines = mat_remaining
 
     # Render work/post sections; start below materials if needed
-    post_title = labels["post_registrations"]
+    post_title = SECTION_TITLES["post_registrations"]
     fixed_post_y_title = 244.09
 
     def ensure_space_for_section(y_title: float) -> bool:
@@ -1314,7 +1402,8 @@ def render_photos_pages(c: Canvas, report: ReportRow, template: Optional[ExportT
     groups: List[Tuple[str, List[Photo]]] = []
     seen_order: List[str] = []
     by_label: Dict[str, List[Photo]] = {}
-    for p in (report.photos or []):
+    registered_photos = export_field_value(report, template.section_fields["photos"][0], [])
+    for p in registered_photos:
         lbl = p.label or "UNLABELED"
         if lbl not in by_label:
             by_label[lbl] = []
@@ -1464,11 +1553,11 @@ def process_zip_to_folder_and_pdf(zip_path: Path, out_dir: Path, project_overrid
             report_datetime=dt_str,
             # Always force subcontractor name (requested)
             naam_onderaannemer="F.A.S.T. Support BV.",
-            project_locatie_naam=(project_override.strip() if project_override and project_override.strip() else (fields.get("Project/Locatie Naam", "").strip() or "Niet ingevuld")),
-            building_id=fields.get("Building ID", "").strip() or "Niet ingevuld",
-            adres=sanitize_address(fields.get("Adres", "").strip()) or "Niet ingevuld",
-            postcode_stad=(fields.get("Postcode + Stad", "") or "").replace("+", " ").strip() or "Niet ingevuld",
-            contactpersoon=fields.get("Contactpersoon", "").strip() or "Niet ingevuld",
+            project_locatie_naam=(project_override.strip() if project_override and project_override.strip() else fields.get("Project/Locatie Naam", "").strip()),
+            building_id=fields.get("Building ID", "").strip(),
+            adres=sanitize_address(fields.get("Adres", "").strip()),
+            postcode_stad=(fields.get("Postcode + Stad", "") or "").replace("+", " ").strip(),
+            contactpersoon=fields.get("Contactpersoon", "").strip(),
             quadrant=fields.get("Quadrant", "").strip() or "",
             duct_kleur=fields.get("Gekoppelde kleur subduct", "").strip() or fields.get("Gekoppelde kleur duct", "").strip() or "",
             units_gelast=fields.get("Hoeveel units gelast?", "").strip() or fields.get("Hoeveel units gelast", "").strip() or "",
@@ -1534,20 +1623,14 @@ def process_zip_to_folder_and_pdf(zip_path: Path, out_dir: Path, project_overrid
 
         # Output naming is presentation configuration; CSV parsing remains template-independent.
         template = resolve_export_template(template)
-        try:
-            fn = template.output_filename_pattern.format(
-                building_id=safe_filename(report.building_id),
-                project_name=safe_filename(report.project_locatie_naam),
-                report_datetime=safe_filename(report.report_datetime),
-            )
-            fn = safe_filename(Path(fn).stem) + ".pdf"
-        except (KeyError, ValueError, IndexError):
-            template = WERKLOGGER_EXPORT_TEMPLATE
-            fn = template.output_filename_pattern.format(
-                building_id=safe_filename(report.building_id),
-                project_name=safe_filename(report.project_locatie_naam),
-                report_datetime=safe_filename(report.report_datetime),
-            )
+        filename_values = {
+            key: safe_filename(str(export_field_value(report, key, template.empty_value_fallback)))
+            for key in FILENAME_PLACEHOLDERS
+        }
+        fn = substitute_export_placeholders(
+            template.output_filename_pattern, filename_values, FILENAME_PLACEHOLDERS
+        )
+        fn = safe_filename(Path(fn).stem) + ".pdf"
         pdf_path = out_dir / fn
 
         _log("Generating PDF...")
@@ -1605,18 +1688,19 @@ if tk is not None:
             book.add(labels, text="CSV-backed fields / labels")
 
             self.name_var = tk.StringVar(); self.title_var = tk.StringVar(); self.pattern_var = tk.StringVar()
+            self.fallback_var = tk.StringVar()
             self.rows_var = tk.StringVar(); self.columns_var = tk.StringVar()
             general.columnconfigure(1, weight=1)
             fields = (("Template name", self.name_var), ("Report title", self.title_var),
                       ("Filename pattern", self.pattern_var), ("Photo rows", self.rows_var),
-                      ("Photo columns", self.columns_var))
+                      ("Photo columns", self.columns_var), ("Empty value fallback", self.fallback_var))
             for row, (caption, variable) in enumerate(fields):
                 ttk.Label(general, text=caption).grid(row=row, column=0, sticky="w", padx=(0, 8), pady=3)
                 ttk.Entry(general, textvariable=variable).grid(row=row, column=1, sticky="ew", pady=3)
             ttk.Label(general, text="Placeholders: {building_id}, {project_name}, {report_datetime}").grid(
-                row=5, column=1, sticky="w")
+                row=6, column=1, sticky="w")
             self.color_vars = {key: tk.StringVar() for key in WERKLOGGER_EXPORT_TEMPLATE.colors}
-            for offset, (key, variable) in enumerate(self.color_vars.items(), start=6):
+            for offset, (key, variable) in enumerate(self.color_vars.items(), start=7):
                 ttk.Label(general, text=f"{key.replace('_', ' ').title()} color").grid(row=offset, column=0, sticky="w", pady=3)
                 ttk.Entry(general, textvariable=variable, width=12).grid(row=offset, column=1, sticky="w", pady=3)
 
@@ -1671,6 +1755,7 @@ if tk is not None:
             self.readonly_note.config(text="Built-in compatibility template is read-only; duplicate it to customize." if built_in else "")
             self.name_var.set(template.display_name); self.title_var.set(str(template.branding["report_title"]))
             self.pattern_var.set(template.output_filename_pattern)
+            self.fallback_var.set(template.empty_value_fallback)
             self.rows_var.set(str(template.photo_grid["rows"])); self.columns_var.set(str(template.photo_grid["columns"]))
             for key, variable in self.color_vars.items(): variable.set(self._hex(template.colors[key]))
             for key, variable in self.section_vars.items(): variable.set(key in template.enabled_sections)
@@ -1737,7 +1822,7 @@ if tk is not None:
                 messagebox.showerror("Cannot save template", "\n".join(errors), parent=self); return
             data = export_template_to_dict(current)
             data.update(display_name=self.name_var.get().strip(), output_filename_pattern=self.pattern_var.get().strip(),
-                        enabled_sections=enabled, section_order=order)
+                        empty_value_fallback=self.fallback_var.get(), enabled_sections=enabled, section_order=order)
             data["branding"]["report_title"] = self.title_var.get().strip()
             data["colors"] = {key: [int(value.get().strip()[i:i+2], 16) / 255 for i in (1, 3, 5)] for key, value in self.color_vars.items()}
             data["photo_grid"].update(rows=int(self.rows_var.get()), columns=int(self.columns_var.get()))
