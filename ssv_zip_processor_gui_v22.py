@@ -1196,240 +1196,185 @@ def _draw_kv_lines(c: Canvas, x_label: float, x_val: float, y: float, items: Lis
     return y
 
 
-def render_page1(c: Canvas, report: ReportRow, template: Optional[ExportTemplate] = None) -> None:
-    """
-    Render the first report page to match the reference PDF layout (A4).
+@dataclass
+class _Page1RenderContext:
+    """Shared drawing state used by the ordered page-one section renderers."""
 
-    Notes:
-    - Uses fixed coordinates derived from the reference PDF.
-    - Designed to match visually; if lists grow beyond the reserved space, they will be clipped.
-      (Photos always start on the next page.)
-    """
-    template = resolve_export_template(template)
-    w, h = template.page_settings["pagesize"]
-    layout = template.layout
-    labels = template.field_labels
-    value = lambda key: export_field_value(report, key, template.empty_value_fallback)
-    X_LEFT, X_RIGHT = layout["left"], layout["right"]
-    RED, GOLD = template.colors["primary"], template.colors["secondary"]
-    GREEN_BAR, YES_GREEN = template.colors["status_bar"], template.colors["status_yes"]
-    LINE_W = layout["line_width"]
+    canvas: Canvas
+    report: ReportRow
+    template: ExportTemplate
+    page_number: int = 1
 
-    # Header banner
-    banner_y0 = layout["banner_y"]
-    banner_h = layout["banner_height"]
-    c.setFillColorRGB(*RED)
-    c.rect(0, banner_y0, w, banner_h, stroke=0, fill=1)
+    def value(self, key: str) -> Any:
+        return export_field_value(self.report, key, self.template.empty_value_fallback)
 
-    # Title (black) + datetime (white, right-aligned)
-    c.setFillColorRGB(0, 0, 0)
-    c.setFont("Helvetica-Bold", 16)
-    c.drawString(X_LEFT, layout["title_y"], template.branding["report_title"])
+    @property
+    def top_y(self) -> float:
+        return 739.78
 
-    c.setFillColorRGB(1, 1, 1)
-    c.setFont("Helvetica-Bold", 10)
-    c.drawRightString(X_RIGHT, layout["datetime_y"], value("report_datetime"))
-
-    dy = layout["line_spacing"]
-
-    # Helper: section title + underline
-    def draw_section(title: str, y_title: float, line_y: float, color: Tuple[float, float, float]) -> None:
-        c.setFillColorRGB(*color)
-        c.setFont("Helvetica", 14)
-        c.drawString(X_LEFT, y_title, title)
-        c.setStrokeColorRGB(*color)
-        c.setLineWidth(LINE_W)
-        c.line(X_LEFT, line_y, X_RIGHT, line_y)
-        c.setFillColorRGB(0, 0, 0)
-
-    if "address" in template.enabled_sections:
-        # ======================
-        # Adresgegevens
-        # ======================
-        draw_section(SECTION_TITLES["address"], y_title=739.78, line_y=731.34, color=RED)
-
-        addr_x_val = layout["address_value_x"]
-        y = 715.0956
-
-        addr_items = [
-            (labels[key], value(key)) for key in template.section_fields["address"]
-        ]
-
-        for k, v in addr_items:
-            c.setFont("Helvetica-Bold", 10)
-            c.drawString(X_LEFT, y, k)
-            c.setFont("Helvetica", 10)
-            c.drawString(addr_x_val, y, v or "")
-            y -= dy
-
-    if "lmra" in template.enabled_sections:
-        # ======================
-        # LMRA Checklist
-        # ======================
-        draw_section(SECTION_TITLES["lmra"], y_title=581.04, line_y=572.60, color=RED)
-
-        # Status bar
-        bar_y0 = 538.5827
-        bar_h = 19.8425
-        c.setFillColorRGB(*GREEN_BAR)
-        c.rect(X_LEFT, bar_y0, X_RIGHT - X_LEFT, bar_h, stroke=0, fill=1)
-
-        c.setFillColorRGB(0, 0, 0)
-        c.setFont("Helvetica", 11)
-        c.drawCentredString((X_LEFT + X_RIGHT) / 2.0, bar_y0 + 5.0, "LMRA Status: OK - Werk kan worden uitgevoerd")
-
-        # Checklist rows
-        checklist_x_yes = layout["checklist_yes_x"]
-        checklist_items = [
-            "Veiligheidsrisico's geïdentificeerd",
-            "Juiste PBM aanwezig",
-            "Werknemers geïnformeerd",
-            "Noodprocedures bekend",
-            "Werkgebied afgezet",
-            "Vergunningen aanwezig",
-        ]
-        y = 522.3386
-        for item in checklist_items:
-            c.setFillColorRGB(0, 0, 0)
-            c.setFont("Helvetica-Bold", 10)
-            c.drawString(X_LEFT, y, item)
-
-            c.setFillColorRGB(*YES_GREEN)
-            c.setFont("Helvetica-Bold", 10)
-            c.drawString(checklist_x_yes, y, "JA")
-            y -= dy
-
-        c.setFillColorRGB(0, 0, 0)
-
-    if "work_details" in template.enabled_sections:
-        # ======================
-        # Uitgevoerde Werken - Details
-        # ======================
-        draw_section(SECTION_TITLES["work_details"], y_title=405.29, line_y=396.85, color=RED)
-
-        details_x_val = layout["details_value_x"]
-        y = 380.6142
-        details_items = [
-            (labels[key], value(key)) for key in template.section_fields["work_details"]
-        ]
-        for k, v in details_items:
-            c.setFont("Helvetica-Bold", 10)
-            c.drawString(X_LEFT, y, k)
-            c.setFont("Helvetica", 10)
-            c.drawString(details_x_val, y, v or "")
-            y -= dy
-    # ======================
-    # Gebruikte materialen + Post Afmeldingen (paginated)
-    # ======================
-
-    bullet_x = X_LEFT
-    text_x = 62.97
-    c.setFont("Helvetica", 10)
-    c.setFillColorRGB(0, 0, 0)
-
-    TITLE_TO_LINE = 8.45
-    TITLE_TO_TEXT = 24.6898
-    BOTTOM_Y = template.page_settings["bottom_y"]
-    GAP_AFTER_SECTION = 14.0
-
-    def draw_header_only() -> None:
-        # Header banner
-        c.setFillColorRGB(*RED)
-        c.rect(0, banner_y0, w, banner_h, stroke=0, fill=1)
+    def draw_header(self, continuation: bool = False) -> None:
+        c, layout = self.canvas, self.template.layout
+        width, _ = self.template.page_settings["pagesize"]
+        red = self.template.colors["primary"]
+        c.setFillColorRGB(*red)
+        c.rect(0, layout["banner_y"], width, layout["banner_height"], stroke=0, fill=1)
         c.setFillColorRGB(1, 1, 1)
         c.setFont("Helvetica-Bold", 16)
-        c.drawString(X_LEFT, layout["title_y"], template.branding["report_title"])
+        c.drawString(layout["left"], layout["title_y"], self.template.branding["report_title"])
         c.setFont("Helvetica-Bold", 10)
-        c.drawRightString(X_RIGHT, layout["datetime_y"], value("report_datetime"))
+        c.drawRightString(layout["right"], layout["datetime_y"], self.value("report_datetime"))
+        if not continuation:
+            # The compatibility layout has a black report title on its first page.
+            c.setFillColorRGB(0, 0, 0)
+            c.setFont("Helvetica-Bold", 16)
+            c.drawString(layout["left"], layout["title_y"], self.template.branding["report_title"])
         c.setFillColorRGB(0, 0, 0)
 
-    def draw_bullet_lines(lines: list[str], y_start: float) -> tuple[list[str], float]:
-        """Draw bullets until we hit BOTTOM_Y. Keeps each bullet together (no split mid-bullet)."""
-        y = y_start
-        remaining: list[str] = []
-        for i, line in enumerate(lines):
-            wrapped = _wrap_lines(line, 110) or ["-"]
-            needed = max(1, len(wrapped))
-            if y - dy * (needed - 1) < BOTTOM_Y:
-                remaining = lines[i:]
+    def new_page(self) -> float:
+        self.canvas.showPage()
+        self.page_number += 1
+        self.draw_header(continuation=True)
+        return self.top_y
+
+    def draw_section_title(self, title: str, y: float, color: Tuple[float, float, float]) -> None:
+        c, layout = self.canvas, self.template.layout
+        c.setFillColorRGB(*color)
+        c.setFont("Helvetica", 14)
+        c.drawString(layout["left"], y, title)
+        c.setStrokeColorRGB(*color)
+        c.setLineWidth(layout["line_width"])
+        c.line(layout["left"], y - 8.45, layout["right"], y - 8.45)
+        c.setFillColorRGB(0, 0, 0)
+
+    def ensure_space(self, y: float, required_height: float) -> float:
+        if y - required_height < self.template.page_settings["bottom_y"]:
+            return self.new_page()
+        return y
+
+
+def _render_address_section(ctx: _Page1RenderContext, y: float) -> float:
+    y = ctx.ensure_space(y, 145.0)
+    ctx.draw_section_title(SECTION_TITLES["address"], y, ctx.template.colors["primary"])
+    row_y = y - 24.6844
+    for key in ctx.template.section_fields["address"]:
+        ctx.canvas.setFont("Helvetica-Bold", 10)
+        ctx.canvas.drawString(ctx.template.layout["left"], row_y, ctx.template.field_labels[key])
+        ctx.canvas.setFont("Helvetica", 10)
+        ctx.canvas.drawString(ctx.template.layout["address_value_x"], row_y, ctx.value(key) or "")
+        row_y -= ctx.template.layout["line_spacing"]
+    return y - 158.74
+
+
+def _render_lmra_section(ctx: _Page1RenderContext, y: float) -> float:
+    y = ctx.ensure_space(y, 165.0)
+    c, layout = ctx.canvas, ctx.template.layout
+    ctx.draw_section_title(SECTION_TITLES["lmra"], y, ctx.template.colors["primary"])
+    bar_y = y - 42.4573
+    c.setFillColorRGB(*ctx.template.colors["status_bar"])
+    c.rect(layout["left"], bar_y, layout["right"] - layout["left"], 19.8425, stroke=0, fill=1)
+    c.setFillColorRGB(0, 0, 0)
+    c.setFont("Helvetica", 11)
+    c.drawCentredString((layout["left"] + layout["right"]) / 2.0, bar_y + 5.0,
+                        "LMRA Status: OK - Werk kan worden uitgevoerd")
+    row_y = y - 58.7014
+    for item in ("Veiligheidsrisico's geïdentificeerd", "Juiste PBM aanwezig",
+                 "Werknemers geïnformeerd", "Noodprocedures bekend",
+                 "Werkgebied afgezet", "Vergunningen aanwezig"):
+        c.setFillColorRGB(0, 0, 0)
+        c.setFont("Helvetica-Bold", 10)
+        c.drawString(layout["left"], row_y, item)
+        c.setFillColorRGB(*ctx.template.colors["status_yes"])
+        c.drawString(layout["checklist_yes_x"], row_y, "JA")
+        row_y -= layout["line_spacing"]
+    c.setFillColorRGB(0, 0, 0)
+    return y - 175.75
+
+
+def _render_work_details_section(ctx: _Page1RenderContext, y: float) -> float:
+    y = ctx.ensure_space(y, 65.0)
+    ctx.draw_section_title(SECTION_TITLES["work_details"], y, ctx.template.colors["primary"])
+    row_y = y - 24.6758
+    for key in ctx.template.section_fields["work_details"]:
+        ctx.canvas.setFont("Helvetica-Bold", 10)
+        ctx.canvas.drawString(ctx.template.layout["left"], row_y, ctx.template.field_labels[key])
+        ctx.canvas.setFont("Helvetica", 10)
+        ctx.canvas.drawString(ctx.template.layout["details_value_x"], row_y, ctx.value(key) or "")
+        row_y -= ctx.template.layout["line_spacing"]
+    return y - 70.86
+
+
+def _render_bullet_section(ctx: _Page1RenderContext, y: float, section: str) -> float:
+    raw = ctx.value(ctx.template.section_fields[section][0])
+    lines = list(raw if isinstance(raw, list) else [raw])
+    title = SECTION_TITLES[section]
+    dy = ctx.template.layout["line_spacing"]
+    while True:
+        y = ctx.ensure_space(y, 24.6898 + dy)
+        ctx.draw_section_title(title, y, ctx.template.colors["secondary"])
+        text_y = y - 24.6898
+        remaining: List[str] = []
+        for index, line in enumerate(lines):
+            wrapped = _wrap_lines(str(line), 110) or ["-"]
+            if text_y - dy * (len(wrapped) - 1) < ctx.template.page_settings["bottom_y"]:
+                remaining = lines[index:]
                 break
-            # bullet line
-            c.drawString(bullet_x, y, u"\u2022")
-            c.drawString(text_x, y, wrapped[0])
-            y -= dy
-            for cont in wrapped[1:]:
-                c.drawString(text_x, y, cont)
-                y -= dy
-        return remaining, y
+            ctx.canvas.setFont("Helvetica", 10)
+            ctx.canvas.drawString(ctx.template.layout["left"], text_y, u"\u2022")
+            ctx.canvas.drawString(62.97, text_y, wrapped[0])
+            text_y -= dy
+            for continuation in wrapped[1:]:
+                ctx.canvas.drawString(62.97, text_y, continuation)
+                text_y -= dy
+        if not remaining:
+            return text_y - 14.0
+        y = ctx.new_page()
+        title = SECTION_TITLES[section].rstrip(":") + " (vervolg):"
+        lines = remaining
 
-    # Render materials across pages if needed
-    mat_value = value(template.section_fields["materials"][0])
-    work_value = value(template.section_fields["post_registrations"][0])
-    mat_lines = list(mat_value if isinstance(mat_value, list) else [mat_value])
-    work_lines = list(work_value if isinstance(work_value, list) else [work_value])
 
-    on_first_page = True
-    mat_title = SECTION_TITLES["materials"]
-    mat_y_title = 334.43
-    mat_y_text = 309.7402
+def _render_materials_section(ctx: _Page1RenderContext, y: float) -> float:
+    return _render_bullet_section(ctx, y, "materials")
 
-    while True:
-        if "materials" in template.enabled_sections:
-            draw_section(mat_title, y_title=mat_y_title, line_y=mat_y_title - TITLE_TO_LINE, color=GOLD)
-            c.setFont("Helvetica", 10)
-            mat_remaining, y_after_mat = draw_bullet_lines(mat_lines, mat_y_text)
-        else:
-            mat_remaining, y_after_mat = [], 358.0
-        if not mat_remaining:
-            break
-        # continue on a new page
-        c.showPage()
-        on_first_page = False
-        draw_header_only()
-        mat_title = "Gebruikte materialen (vervolg):"
-        mat_y_title = 760.0
-        mat_y_text = mat_y_title - TITLE_TO_TEXT
-        mat_lines = mat_remaining
 
-    # Render work/post sections; start below materials if needed
-    post_title = SECTION_TITLES["post_registrations"]
-    fixed_post_y_title = 244.09
+def _render_post_registrations_section(ctx: _Page1RenderContext, y: float) -> float:
+    return _render_bullet_section(ctx, y, "post_registrations")
 
-    def ensure_space_for_section(y_title: float) -> bool:
-        # True if we can draw at least one bullet line on this page
-        return (y_title - TITLE_TO_TEXT) >= (BOTTOM_Y + dy)
 
-    # Determine starting title position
-    if on_first_page and y_after_mat > (fixed_post_y_title + 30.0):
-        post_y_title = fixed_post_y_title
-    else:
-        post_y_title = y_after_mat - GAP_AFTER_SECTION
+PAGE1_SECTION_RENDERERS: Mapping[str, Callable[[_Page1RenderContext, float], float]] = {
+    "address": _render_address_section,
+    "lmra": _render_lmra_section,
+    "work_details": _render_work_details_section,
+    "materials": _render_materials_section,
+    "post_registrations": _render_post_registrations_section,
+}
 
-    if not ensure_space_for_section(post_y_title):
-        c.showPage()
-        on_first_page = False
-        draw_header_only()
-        post_y_title = 725.0
 
-    post_y_text = post_y_title - TITLE_TO_TEXT
-    post_lines = work_lines
+def render_page1(c: Canvas, report: ReportRow, template: Optional[ExportTemplate] = None) -> None:
+    """
+    Render enabled non-photo sections in the order declared by the template.
 
-    while True:
-        if "post_registrations" in template.enabled_sections:
-            draw_section(post_title, y_title=post_y_title, line_y=post_y_title - TITLE_TO_LINE, color=GOLD)
-            c.setFont("Helvetica", 10)
-            post_remaining, y_after_post = draw_bullet_lines(post_lines, post_y_text)
-        else:
-            post_remaining, y_after_post = [], post_y_text
-        if not post_remaining:
-            break
-        c.showPage()
-        on_first_page = False
-        draw_header_only()
-        post_title = "Post Afmeldingen (vervolg):"
-        post_y_title = 725.0
-        post_y_text = post_y_title - TITLE_TO_TEXT
-        post_lines = post_remaining
+    The built-in template retains its historic fixed section coordinates.  Custom
+    templates use the returned vertical position from each renderer, so reordering
+    ``section_order`` also reorders the visible PDF content.
+    """
+    template = resolve_export_template(template)
+    ctx = _Page1RenderContext(c, report, template)
+    ctx.draw_header()
+    enabled = set(template.enabled_sections)
+    ordered_sections = [name for name in template.section_order
+                        if name in enabled and name in PAGE1_SECTION_RENDERERS]
+    compatibility_layout = template is WERKLOGGER_EXPORT_TEMPLATE
+    compatibility_y = {
+        "address": 739.78, "lmra": 581.04, "work_details": 405.29,
+        "materials": 334.43, "post_registrations": 244.09,
+    }
+    y = ctx.top_y
+    for section in ordered_sections:
+        # Fixed anchors are intentionally limited to the built-in template.  A
+        # custom template always consumes the preceding renderer's position.
+        if compatibility_layout and ctx.page_number == 1:
+            y = compatibility_y[section]
+        y = PAGE1_SECTION_RENDERERS[section](ctx, y)
 
 
 
