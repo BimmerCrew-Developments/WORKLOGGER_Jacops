@@ -280,6 +280,18 @@ class TemplateRecord:
     display_name: str
 
 
+@dataclass(frozen=True)
+class ExportTemplate:
+    """Rendering configuration selected by a stable template record ID."""
+
+    id: str
+    display_name: str
+    page_settings: dict
+    section_order: Tuple[str, ...]
+    enabled_sections: Set[str]
+    output_filename_pattern: str
+
+
 @dataclass
 class AppConfig:
     version: int
@@ -287,9 +299,33 @@ class AppConfig:
     templates: List[TemplateRecord]
 
 
+WERKLOGGER_EXPORT_TEMPLATE = ExportTemplate(
+    id=DEFAULT_EXPORT_TEMPLATE_ID,
+    display_name="Werklogger report",
+    page_settings={"pagesize": A4},
+    section_order=("report", "materials", "post_registrations", "photos"),
+    enabled_sections={"report", "materials", "post_registrations", "photos"},
+    output_filename_pattern="{building_id}-{project_name}-{report_datetime}-RAPPORT.pdf",
+)
+EXPORT_TEMPLATES = {WERKLOGGER_EXPORT_TEMPLATE.id: WERKLOGGER_EXPORT_TEMPLATE}
 DEFAULT_TEMPLATES = [
-    TemplateRecord(DEFAULT_EXPORT_TEMPLATE_ID, "Werklogger report"),
+    TemplateRecord(template.id, template.display_name)
+    for template in EXPORT_TEMPLATES.values()
 ]
+
+
+def resolve_export_template(
+    template: Optional[ExportTemplate] = None,
+    template_id: Optional[str] = None,
+) -> ExportTemplate:
+    """Resolve a renderer or its stable ID to a supported export template."""
+    if template is not None:
+        return template
+    resolved_id = template_id or DEFAULT_EXPORT_TEMPLATE_ID
+    try:
+        return EXPORT_TEMPLATES[resolved_id]
+    except KeyError as exc:
+        raise ValueError(f"Unknown export template ID: {resolved_id}") from exc
 
 DEFAULT_PROJECTS: list[str] = [
     "MRO_ARDOOIE_01",
@@ -936,7 +972,11 @@ def _draw_kv_lines(c: Canvas, x_label: float, x_val: float, y: float, items: Lis
     return y
 
 
-def render_page1(c: Canvas, report: ReportRow) -> None:
+def render_page1(
+    c: Canvas,
+    report: ReportRow,
+    template: Optional[ExportTemplate] = None,
+) -> None:
     """
     Render the first report page to match the reference PDF layout (A4).
 
@@ -945,7 +985,8 @@ def render_page1(c: Canvas, report: ReportRow) -> None:
     - Designed to match visually; if lists grow beyond the reserved space, they will be clipped.
       (Photos always start on the next page.)
     """
-    w, h = A4
+    template = resolve_export_template(template)
+    w, h = template.page_settings["pagesize"]
 
     # Reference-derived coordinates (points)
     X_LEFT = 56.6929
@@ -1172,9 +1213,14 @@ def render_page1(c: Canvas, report: ReportRow) -> None:
 
 
 
-def render_photos_pages(c: Canvas, report: ReportRow) -> None:
+def render_photos_pages(
+    c: Canvas,
+    report: ReportRow,
+    template: Optional[ExportTemplate] = None,
+) -> None:
     """Render photo pages matching the reference layout (2 columns, 3 rows per page)."""
-    w, h = A4
+    template = resolve_export_template(template)
+    w, h = template.page_settings["pagesize"]
 
     X_LEFT = 56.6929
     X_RIGHT = 538.5827
@@ -1300,30 +1346,27 @@ def create_output_zip(out_zip_path: Path, files: List[Tuple[Path, str]]) -> None
 
 
 
-def build_pdf(
-    out_pdf_path: Path,
-    report: ReportRow,
-    export_template_id: str = DEFAULT_EXPORT_TEMPLATE_ID,
-) -> None:
-    if export_template_id != DEFAULT_EXPORT_TEMPLATE_ID:
-        raise ValueError(f"Unknown export template ID: {export_template_id}")
-    c = Canvas(str(out_pdf_path), pagesize=A4)
-    render_page1(c, report)
-    c.showPage()
-    render_photos_pages(c, report)
+def build_pdf(out_pdf_path: Path, report: ReportRow, template: Optional[ExportTemplate] = None) -> None:
+    template = resolve_export_template(template)
+    c = Canvas(str(out_pdf_path), pagesize=template.page_settings["pagesize"])
+    non_photo_sections = [
+        section
+        for section in template.section_order
+        if section != "photos" and section in template.enabled_sections
+    ]
+    if non_photo_sections:
+        render_page1(c, report, template)
+    if "photos" in template.enabled_sections and report.photos:
+        if non_photo_sections:
+            c.showPage()
+        render_photos_pages(c, report, template)
     c.save()
 
 
 # =========================
 # Image processing + report building
 # =========================
-def process_zip_to_folder_and_pdf(
-    zip_path: Path,
-    out_dir: Path,
-    project_override: Optional[str] = None,
-    log: Optional[callable] = None,
-    export_template_id: str = DEFAULT_EXPORT_TEMPLATE_ID,
-) -> ProcessResult:
+def process_zip_to_folder_and_pdf(zip_path: Path, out_dir: Path, project_override: Optional[str] = None, log: Optional[callable] = None, template: Optional[ExportTemplate] = None) -> ProcessResult:
     def _log(msg: str) -> None:
         if log:
             log(msg)
@@ -1434,12 +1477,26 @@ def process_zip_to_folder_and_pdf(
 
         report.photos = processed_photos
 
-        # Output PDF name
-        fn = f"{safe_filename(report.building_id)}-{safe_filename(report.project_locatie_naam)}-{safe_filename(report.report_datetime)}-RAPPORT.pdf"
+        # Output naming is presentation configuration; CSV parsing remains template-independent.
+        template = resolve_export_template(template)
+        try:
+            fn = template.output_filename_pattern.format(
+                building_id=safe_filename(report.building_id),
+                project_name=safe_filename(report.project_locatie_naam),
+                report_datetime=safe_filename(report.report_datetime),
+            )
+            fn = safe_filename(Path(fn).stem) + ".pdf"
+        except (KeyError, ValueError, IndexError):
+            template = WERKLOGGER_EXPORT_TEMPLATE
+            fn = template.output_filename_pattern.format(
+                building_id=safe_filename(report.building_id),
+                project_name=safe_filename(report.project_locatie_naam),
+                report_datetime=safe_filename(report.report_datetime),
+            )
         pdf_path = out_dir / fn
 
         _log("Generating PDF...")
-        build_pdf(pdf_path, report, export_template_id)
+        build_pdf(pdf_path, report, template)
         _log(f"Saved PDF: {pdf_path.name}")
 
         # Create output ZIP containing: generated report PDF, processed JPEGs, and any input PDF attachments.
@@ -1600,8 +1657,8 @@ if tk is not None:
                     self.zip_path,
                     self.out_dir,
                     project_override=self.project_var.get(),
-                    export_template_id=template.id,
                     log=self.log,
+                    template=resolve_export_template(template_id=template.id),
                 )
                 self.log(f"Done. Images written: {res.written_images}")
                 messagebox.showinfo("Success", f"Finished.\nImages: {res.written_images}\nPDF: {res.pdf_path.name}")
@@ -1634,8 +1691,8 @@ def main() -> None:
             Path(args.zip_path),
             Path(args.out_dir),
             project_override=args.project,
-            export_template_id=args.export_template,
             log=print,
+            template=resolve_export_template(template_id=args.export_template),
         )
         print(f"PDF: {res.pdf_path}")
         return
