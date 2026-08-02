@@ -620,7 +620,25 @@ DEFAULT_PROJECTS: list[str] = [
 ]
 
 
-PROJECT_CONFIG_VERSION = 1
+PROJECT_CONFIG_VERSION = 2
+
+
+@dataclass(frozen=True)
+class ProjectRecord:
+    """A persisted project and its preferred export template."""
+
+    project_id: str
+    display_name: str
+    default_template_id: str = WERKLOGGER_EXPORT_TEMPLATE.template_id
+
+
+def _project_record(name: str) -> ProjectRecord:
+    """Convert a historical project name to a stable version-2 record."""
+    name = name.strip()
+    return ProjectRecord(name, name, WERKLOGGER_EXPORT_TEMPLATE.template_id)
+
+
+DEFAULT_PROJECT_RECORDS = tuple(_project_record(name) for name in DEFAULT_PROJECTS)
 
 
 class ProjectConfigurationError(RuntimeError):
@@ -644,25 +662,46 @@ def _legacy_project_paths() -> Tuple[Path, Path]:
     return adjacent_base / "projects.json", Path.home() / ".ssv_zip_processor_projects.json"
 
 
-def _decode_project_config(path: Path, *, legacy: bool = False) -> List[str]:
+def _decode_project_config(path: Path, *, legacy: bool = False) -> List[ProjectRecord]:
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         raise ProjectConfigurationError(f"Could not read project configuration {path}: {exc}") from exc
+    version = 1 if legacy else data.get("version") if isinstance(data, dict) else None
     if legacy:
         projects = data
     else:
         if (not isinstance(data, dict) or type(data.get("version")) is not int
-                or data.get("version") != PROJECT_CONFIG_VERSION):
-            version = data.get("version") if isinstance(data, dict) else None
+                or data.get("version") not in (1, PROJECT_CONFIG_VERSION)):
             raise ProjectConfigurationError(
                 f"Unsupported project configuration version {version!r} in {path}; "
                 f"expected {PROJECT_CONFIG_VERSION}."
             )
         projects = data.get("projects")
-    if not isinstance(projects, list) or any(not isinstance(item, str) for item in projects):
+    if not isinstance(projects, list):
         raise ProjectConfigurationError(f"Invalid project list in {path}.")
-    return [item.strip() for item in projects if item.strip()]
+    if version == 1:
+        if any(not isinstance(item, str) for item in projects):
+            raise ProjectConfigurationError(f"Invalid version-1 project list in {path}.")
+        return [_project_record(item) for item in projects if item.strip()]
+    records: List[ProjectRecord] = []
+    for item in projects:
+        if (not isinstance(item, dict)
+                or any(not isinstance(item.get(key), str)
+                       for key in ("project_id", "display_name", "default_template_id"))):
+            raise ProjectConfigurationError(f"Invalid project record in {path}.")
+        try:
+            record = ProjectRecord(
+                project_id=str(item["project_id"]).strip(),
+                display_name=str(item["display_name"]).strip(),
+                default_template_id=str(item["default_template_id"]).strip(),
+            )
+        except (KeyError, TypeError) as exc:
+            raise ProjectConfigurationError(f"Invalid project record in {path}.") from exc
+        if not record.project_id or not record.display_name or not record.default_template_id:
+            raise ProjectConfigurationError(f"Invalid project record in {path}.")
+        records.append(record)
+    return records
 
 
 def _atomic_write(path: Path, content: str) -> None:
@@ -681,16 +720,19 @@ def _atomic_write(path: Path, content: str) -> None:
             temp_path.unlink(missing_ok=True)
 
 
-def save_projects(projects: List[str]) -> None:
-    """Atomically save custom projects and back up the last valid configuration."""
-    defaults = set(DEFAULT_PROJECTS)
-    custom = list(dict.fromkeys(item.strip() for item in projects if item.strip() and item not in defaults))
+def save_projects(projects: List[ProjectRecord]) -> None:
+    """Atomically save project records and back up the last valid configuration."""
+    unique = list({project.project_id: project for project in projects}.values())
     path = project_config_path()
     try:
         if path.exists():
             _decode_project_config(path)  # Never replace an invalid file or call it a valid backup.
             _atomic_write(path.with_suffix(path.suffix + ".bak"), path.read_text(encoding="utf-8"))
-        document = {"version": PROJECT_CONFIG_VERSION, "projects": custom}
+        document = {"version": PROJECT_CONFIG_VERSION, "projects": [
+            {"project_id": project.project_id, "display_name": project.display_name,
+             "default_template_id": project.default_template_id}
+            for project in unique
+        ]}
         _atomic_write(path, json.dumps(document, ensure_ascii=False, indent=2) + "\n")
     except (OSError, UnicodeError, ProjectConfigurationError) as exc:
         if isinstance(exc, ProjectConfigurationError):
@@ -698,12 +740,16 @@ def save_projects(projects: List[str]) -> None:
         raise ProjectConfigurationError(f"Could not write project configuration {path}: {exc}") from exc
 
 
-def load_projects() -> List[str]:
+def load_projects() -> List[ProjectRecord]:
     """Load the versioned configuration, migrating both historical locations once."""
     path = project_config_path()
-    custom: List[str] = []
+    custom: List[ProjectRecord] = []
     if path.exists():
         custom = _decode_project_config(path)
+        # Reading a v1 document is also its in-place, lossless migration.
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        if raw.get("version") == 1:
+            save_projects([*DEFAULT_PROJECT_RECORDS, *custom])
     else:
         legacy_found = False
         for legacy_path in dict.fromkeys(_legacy_project_paths()):
@@ -713,7 +759,13 @@ def load_projects() -> List[str]:
         if legacy_found:
             save_projects(custom)
 
-    return list(dict.fromkeys([*DEFAULT_PROJECTS, *custom]))
+    return list({project.project_id: project for project in [*DEFAULT_PROJECT_RECORDS, *custom]}.values())
+
+
+def project_default_template(project: ProjectRecord, templates: List[ExportTemplate]) -> ExportTemplate:
+    """Resolve a project's default, safely falling back when it was deleted."""
+    return next((template for template in templates
+                 if template.template_id == project.default_template_id), WERKLOGGER_EXPORT_TEMPLATE)
 
 
 # =========================
@@ -1921,17 +1973,18 @@ if tk is not None:
             try:
                 self.projects = load_projects()
             except ProjectConfigurationError as exc:
-                self.projects = list(DEFAULT_PROJECTS)
+                self.projects = list(DEFAULT_PROJECT_RECORDS)
                 messagebox.showerror("Project configuration error", str(exc), parent=self)
             self.project_var = tk.StringVar(value="")
             self.cmb_project = ttk.Combobox(
                 proj_row,
                 textvariable=self.project_var,
-                values=([''] + self.projects),
+                values=([''] + [project.display_name for project in self.projects]),
                 state="readonly",
                 width=32,
             )
             self.cmb_project.pack(side="left", padx=(0, 10))
+            self.cmb_project.bind("<<ComboboxSelected>>", self.on_project_selected)
 
             self.new_project_var = tk.StringVar()
             tk.Entry(proj_row, textvariable=self.new_project_var, width=26).pack(side="left")
@@ -1942,6 +1995,8 @@ if tk is not None:
             self.template_var = tk.StringVar()
             self.cmb_template = ttk.Combobox(template_row, textvariable=self.template_var, state="readonly", width=32)
             self.cmb_template.pack(side="left", padx=(0, 10))
+            tk.Button(template_row, text="Save as project default",
+                      command=self.save_project_default).pack(side="left", padx=(0, 10))
             tk.Button(template_row, text="Manage templates...", command=self.manage_templates).pack(side="left")
             self.set_export_templates(self.export_templates)
     
@@ -1974,20 +2029,56 @@ if tk is not None:
             name = re.sub(r"_+", "_", name).strip("._ ")
             if not name:
                 return
-            if name not in self.projects:
-                self.projects.append(name)
-                self.cmb_project["values"] = ([""] + self.projects)
+            existing = next((project for project in self.projects if project.display_name == name), None)
+            if existing is None:
+                existing = ProjectRecord("project-" + uuid.uuid4().hex, name,
+                                         WERKLOGGER_EXPORT_TEMPLATE.template_id)
+                self.projects.append(existing)
+                self.cmb_project["values"] = ([""] + [project.display_name for project in self.projects])
                 try:
                     save_projects(self.projects)
                 except ProjectConfigurationError as exc:
-                    self.projects.remove(name)
-                    self.cmb_project["values"] = ([""] + self.projects)
+                    self.projects.remove(existing)
+                    self.cmb_project["values"] = ([""] + [project.display_name for project in self.projects])
                     messagebox.showerror("Project configuration error", str(exc), parent=self)
                     self.log(f"Could not save project: {exc}")
                     return
             self.project_var.set(name)
+            self.on_project_selected()
             self.new_project_var.set("")
             self.log(f"Project added/selected: {name}")
+
+        def selected_project(self) -> Optional[ProjectRecord]:
+            return next((project for project in self.projects
+                         if project.display_name == self.project_var.get()), None)
+
+        def on_project_selected(self, _event: Any = None) -> None:
+            """Apply the selected project's default; later template choices remain one-off."""
+            project = self.selected_project()
+            if project is None:
+                return
+            template = project_default_template(project, self.export_templates)
+            self.template_var.set(template.display_name)
+            if template.template_id != project.default_template_id:
+                self.log(f"Project {project.display_name}'s default template is missing; "
+                         "using the built-in template. Save a new default to repair it.")
+
+        def save_project_default(self) -> None:
+            project = self.selected_project()
+            if project is None:
+                messagebox.showinfo("Select project", "Select a project first.", parent=self)
+                return
+            updated = ProjectRecord(project.project_id, project.display_name,
+                                    self.selected_template().template_id)
+            index = self.projects.index(project)
+            self.projects[index] = updated
+            try:
+                save_projects(self.projects)
+            except ProjectConfigurationError as exc:
+                self.projects[index] = project
+                messagebox.showerror("Project configuration error", str(exc), parent=self)
+                return
+            self.log(f"Saved {self.selected_template().display_name} as the default for {project.display_name}.")
 
         def set_export_templates(self, templates: List[ExportTemplate], selected_id: Optional[str] = None) -> None:
             """Refresh template choices immediately after a management operation."""
