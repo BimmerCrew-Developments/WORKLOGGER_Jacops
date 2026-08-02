@@ -170,6 +170,10 @@ class ExportTemplate:
     field_labels: Mapping[str, str]
     photo_grid: Mapping[str, Any]
     output_filename_pattern: str
+    include_photo_pages: bool = True
+    include_loose_images: bool = True
+    include_pdf_attachments: bool = True
+    create_output_zip: bool = True
     empty_value_fallback: str = "Niet ingevuld"
     layout: Mapping[str, Any] = field(default_factory=dict)
 
@@ -202,6 +206,10 @@ WERKLOGGER_EXPORT_TEMPLATE = ExportTemplate(
         "heading_y": 782.30, "underline_y": 773.8585,
     },
     output_filename_pattern="{building_id}-{project_name}-{report_datetime}-RAPPORT.pdf",
+    include_photo_pages=True,
+    include_loose_images=True,
+    include_pdf_attachments=True,
+    create_output_zip=True,
     layout={
         "left": 56.6929, "right": 538.5827, "line_width": 1.4173,
         "banner_y": 771.0236, "banner_height": 42.5197, "title_y": 784.72,
@@ -240,6 +248,10 @@ def export_template_to_dict(template: ExportTemplate) -> Dict[str, Any]:
         "section_fields": {key: list(value) for key, value in template.section_fields.items()},
         "field_labels": dict(template.field_labels), "photo_grid": dict(template.photo_grid),
         "output_filename_pattern": template.output_filename_pattern,
+        "include_photo_pages": template.include_photo_pages,
+        "include_loose_images": template.include_loose_images,
+        "include_pdf_attachments": template.include_pdf_attachments,
+        "create_output_zip": template.create_output_zip,
         "empty_value_fallback": template.empty_value_fallback, "layout": dict(template.layout),
     }
 
@@ -254,6 +266,10 @@ def export_template_from_dict(data: Mapping[str, Any]) -> ExportTemplate:
         section_fields={str(k): tuple(v) for k, v in dict(data.get("section_fields", SECTION_FIELD_KEYS)).items()},
         field_labels={str(k): str(v) for k, v in dict(data["field_labels"]).items()},
         photo_grid=dict(data["photo_grid"]), output_filename_pattern=str(data["output_filename_pattern"]),
+        include_photo_pages=bool(data.get("include_photo_pages", True)),
+        include_loose_images=bool(data.get("include_loose_images", True)),
+        include_pdf_attachments=bool(data.get("include_pdf_attachments", True)),
+        create_output_zip=bool(data.get("create_output_zip", True)),
         empty_value_fallback=str(data.get("empty_value_fallback", "Niet ingevuld")),
         layout=dict(data["layout"]),
     )
@@ -399,6 +415,7 @@ class ProcessResult:
     written_images: int
     output_zip_path: Optional[Path] = None
     copied_pdfs: int = 0
+    generated_artifacts: List[Path] = field(default_factory=list)
 
 
 # =========================
@@ -1485,11 +1502,22 @@ def render_photos_pages(c: Canvas, report: ReportRow, template: Optional[ExportT
 
 
 def create_output_zip(out_zip_path: Path, files: List[Tuple[Path, str]]) -> None:
-    """Create a zip at out_zip_path containing the given files (src_path, arcname)."""
+    """Create an output ZIP without silently replacing files or archive members."""
     if out_zip_path.exists():
-        out_zip_path.unlink()
+        raise FileExistsError(f"Output file already exists: {out_zip_path}")
+    safe_files: List[Tuple[Path, str]] = []
+    seen: Set[str] = set()
+    for src, arcname in files:
+        sanitized = safe_filename(Path(arcname).name)
+        key = sanitized.casefold()
+        if key in seen:
+            raise FileExistsError(f"Duplicate output ZIP member: {sanitized}")
+        if not src.is_file():
+            raise FileNotFoundError(f"ZIP input does not exist: {src}")
+        seen.add(key)
+        safe_files.append((src, sanitized))
     with zipfile.ZipFile(out_zip_path, "w", compression=zipfile.ZIP_DEFLATED) as z:
-        for src, arcname in files:
+        for src, arcname in safe_files:
             z.write(src, arcname)
 
 
@@ -1500,7 +1528,7 @@ def build_pdf(out_pdf_path: Path, report: ReportRow, template: Optional[ExportTe
     non_photo_sections = [s for s in template.section_order if s != "photos" and s in template.enabled_sections]
     if non_photo_sections:
         render_page1(c, report, template)
-    if "photos" in template.enabled_sections and report.photos:
+    if template.include_photo_pages and "photos" in template.enabled_sections and report.photos:
         if non_photo_sections:
             c.showPage()
         render_photos_pages(c, report, template)
@@ -1574,28 +1602,15 @@ def process_zip_to_folder_and_pdf(zip_path: Path, out_dir: Path, project_overrid
                 img_by_stem[p.stem.lower()] = p
         nonimg_stems: Set[str] = {p.stem.lower() for p in all_files if p.is_file() and p.suffix.lower() not in {'.jpeg','.jpg'}}
 
-        # Copy any PDF attachments from the input ZIP to output folder (unchanged)
-        pdf_attachments: List[Path] = []
-        for p in all_files:
-            if p.is_file() and p.suffix.lower() == ".pdf":
-                dest = out_dir / p.name
-                try:
-                    shutil.copy2(p, dest)
-                    pdf_attachments.append(dest)
-                except Exception:
-                    pass
-        if pdf_attachments:
-            _log(f"Copied {len(pdf_attachments)} PDF attachment(s).")
+        template = resolve_export_template(template)
 
-
-        # Process images
-        written = 0
+        # Plan every output before writing anything, so collisions never cause a
+        # partially overwritten export. Image discovery itself is unchanged.
         used_names: Set[str] = set()
-        processed_photos: List[Photo] = []
+        planned_images: List[Tuple[Path, str, str]] = []
 
-        _log("Processing images...")
         for mrow in media_rows:
-            base_label = normalize_label(mrow.label)
+            base_label = safe_filename(normalize_label(mrow.label))
             for idx, mid in enumerate(mrow.media_ids, start=1):
                 src = img_by_stem.get(mid.lower())
                 if not src:
@@ -1606,23 +1621,22 @@ def process_zip_to_folder_and_pdf(zip_path: Path, out_dir: Path, project_overrid
                     continue
 
                 out_base = base_label if len(mrow.media_ids) == 1 else f"{base_label}_{idx}"
-                out_name = f"{out_base}.jpeg"
+                out_name = safe_filename(f"{out_base}.jpeg")
                 if out_name.lower() in used_names:
                     n = 2
-                    while f"{out_base}_{n}.jpeg".lower() in used_names:
+                    while safe_filename(f"{out_base}_{n}.jpeg").lower() in used_names:
                         n += 1
-                    out_name = f"{out_base}_{n}.jpeg"
+                    out_name = safe_filename(f"{out_base}_{n}.jpeg")
                 used_names.add(out_name.lower())
+                planned_images.append((src, out_name, mrow.label))
 
-                out_path = out_dir / out_name
-                shutil.copy2(src, out_path)
-                written += 1
-                processed_photos.append(Photo(label=mrow.label, image_path=out_path))
-
-        report.photos = processed_photos
+        planned_attachments: List[Tuple[Path, Path]] = []
+        if template.include_pdf_attachments:
+            for source in all_files:
+                if source.is_file() and source.suffix.lower() == ".pdf":
+                    planned_attachments.append((source, out_dir / safe_filename(source.name)))
 
         # Output naming is presentation configuration; CSV parsing remains template-independent.
-        template = resolve_export_template(template)
         filename_values = {
             key: safe_filename(str(export_field_value(report, key, template.empty_value_fallback)))
             for key in FILENAME_PLACEHOLDERS
@@ -1632,27 +1646,66 @@ def process_zip_to_folder_and_pdf(zip_path: Path, out_dir: Path, project_overrid
         )
         fn = safe_filename(Path(fn).stem) + ".pdf"
         pdf_path = out_dir / fn
+        out_zip_path: Optional[Path] = None
+        if template.create_output_zip:
+            out_zip_path = out_dir / (safe_filename(Path(fn).stem) + "-OUTPUT.zip")
+
+        loose_image_paths = [out_dir / name for _source, name, _label in planned_images]
+        planned_outputs = [pdf_path]
+        if template.include_loose_images:
+            planned_outputs.extend(loose_image_paths)
+        planned_outputs.extend(destination for _source, destination in planned_attachments)
+        if out_zip_path is not None:
+            planned_outputs.append(out_zip_path)
+        seen_outputs: Dict[str, Path] = {}
+        for destination in planned_outputs:
+            key = destination.name.casefold()
+            if key in seen_outputs:
+                raise FileExistsError(
+                    f"Output filename collision: {seen_outputs[key].name} and {destination.name}"
+                )
+            if destination.exists():
+                raise FileExistsError(f"Output file already exists: {destination}")
+            seen_outputs[key] = destination
+
+        _log("Processing images...")
+        processed_photos: List[Photo] = []
+        for source, name, label in planned_images:
+            destination = out_dir / name if template.include_loose_images else tmp / "processed" / name
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, destination)
+            processed_photos.append(Photo(label=label, image_path=destination))
+        report.photos = processed_photos
+
+        pdf_attachments: List[Path] = []
+        for source, destination in planned_attachments:
+            shutil.copy2(source, destination)
+            pdf_attachments.append(destination)
+        if pdf_attachments:
+            _log(f"Copied {len(pdf_attachments)} PDF attachment(s).")
 
         _log("Generating PDF...")
         build_pdf(pdf_path, report, template)
         _log(f"Saved PDF: {pdf_path.name}")
 
-        # Create output ZIP containing: generated report PDF, processed JPEGs, and any input PDF attachments.
-        out_zip_name = f"{safe_filename(report.building_id)}-{safe_filename(report.project_locatie_naam)}-{safe_filename(report.report_datetime)}-OUTPUT.zip"
-        out_zip_path = out_dir / out_zip_name
+        artifacts = [pdf_path]
+        if template.include_loose_images:
+            artifacts.extend(loose_image_paths)
+        artifacts.extend(pdf_attachments)
 
-        zip_files: List[Tuple[Path, str]] = []
-        zip_files.append((pdf_path, pdf_path.name))
-        for ph in processed_photos:
-            zip_files.append((ph.image_path, ph.image_path.name))
-        for p in pdf_attachments:
-            zip_files.append((p, p.name))
+        if out_zip_path is not None:
+            zip_files = [(path, path.name) for path in artifacts]
+            _log("Creating output ZIP...")
+            create_output_zip(out_zip_path, zip_files)
+            artifacts.append(out_zip_path)
+            _log(f"Saved ZIP: {out_zip_path.name}")
 
-        _log("Creating output ZIP...")
-        create_output_zip(out_zip_path, zip_files)
-        _log(f"Saved ZIP: {out_zip_path.name}")
-
-        return ProcessResult(report=report, pdf_path=pdf_path, written_images=written, output_zip_path=out_zip_path, copied_pdfs=len(pdf_attachments))
+        return ProcessResult(
+            report=report, pdf_path=pdf_path,
+            written_images=len(loose_image_paths) if template.include_loose_images else 0,
+            output_zip_path=out_zip_path, copied_pdfs=len(pdf_attachments),
+            generated_artifacts=artifacts,
+        )
 
 
 # =========================
@@ -1690,6 +1743,12 @@ if tk is not None:
             self.name_var = tk.StringVar(); self.title_var = tk.StringVar(); self.pattern_var = tk.StringVar()
             self.fallback_var = tk.StringVar()
             self.rows_var = tk.StringVar(); self.columns_var = tk.StringVar()
+            self.output_flag_vars = {
+                "include_photo_pages": tk.BooleanVar(),
+                "include_loose_images": tk.BooleanVar(),
+                "include_pdf_attachments": tk.BooleanVar(),
+                "create_output_zip": tk.BooleanVar(),
+            }
             general.columnconfigure(1, weight=1)
             fields = (("Template name", self.name_var), ("Report title", self.title_var),
                       ("Filename pattern", self.pattern_var), ("Photo rows", self.rows_var),
@@ -1699,8 +1758,16 @@ if tk is not None:
                 ttk.Entry(general, textvariable=variable).grid(row=row, column=1, sticky="ew", pady=3)
             ttk.Label(general, text="Placeholders: {building_id}, {project_name}, {report_datetime}").grid(
                 row=6, column=1, sticky="w")
+            for offset, (key, caption) in enumerate((
+                ("include_photo_pages", "Include photo pages in report"),
+                ("include_loose_images", "Write loose processed images"),
+                ("include_pdf_attachments", "Copy imported PDF attachments"),
+                ("create_output_zip", "Create output ZIP"),
+            ), start=7):
+                ttk.Checkbutton(general, text=caption, variable=self.output_flag_vars[key]).grid(
+                    row=offset, column=1, sticky="w", pady=2)
             self.color_vars = {key: tk.StringVar() for key in WERKLOGGER_EXPORT_TEMPLATE.colors}
-            for offset, (key, variable) in enumerate(self.color_vars.items(), start=7):
+            for offset, (key, variable) in enumerate(self.color_vars.items(), start=11):
                 ttk.Label(general, text=f"{key.replace('_', ' ').title()} color").grid(row=offset, column=0, sticky="w", pady=3)
                 ttk.Entry(general, textvariable=variable, width=12).grid(row=offset, column=1, sticky="w", pady=3)
 
@@ -1757,6 +1824,7 @@ if tk is not None:
             self.pattern_var.set(template.output_filename_pattern)
             self.fallback_var.set(template.empty_value_fallback)
             self.rows_var.set(str(template.photo_grid["rows"])); self.columns_var.set(str(template.photo_grid["columns"]))
+            for key, variable in self.output_flag_vars.items(): variable.set(getattr(template, key))
             for key, variable in self.color_vars.items(): variable.set(self._hex(template.colors[key]))
             for key, variable in self.section_vars.items(): variable.set(key in template.enabled_sections)
             self.order_list.delete(0, "end")
@@ -1823,6 +1891,7 @@ if tk is not None:
             data = export_template_to_dict(current)
             data.update(display_name=self.name_var.get().strip(), output_filename_pattern=self.pattern_var.get().strip(),
                         empty_value_fallback=self.fallback_var.get(), enabled_sections=enabled, section_order=order)
+            data.update({key: variable.get() for key, variable in self.output_flag_vars.items()})
             data["branding"]["report_title"] = self.title_var.get().strip()
             data["colors"] = {key: [int(value.get().strip()[i:i+2], 16) / 255 for i in (1, 3, 5)] for key, value in self.color_vars.items()}
             data["photo_grid"].update(rows=int(self.rows_var.get()), columns=int(self.columns_var.get()))
@@ -1968,7 +2037,8 @@ if tk is not None:
                 res = process_zip_to_folder_and_pdf(self.zip_path, self.out_dir, project_override=self.project_var.get(),
                                                     log=self.log, template=self.selected_template())
                 self.log(f"Done. Images written: {res.written_images}")
-                messagebox.showinfo("Success", f"Finished.\nImages: {res.written_images}\nPDF: {res.pdf_path.name}")
+                files = "\n".join(f"• {path.name}" for path in res.generated_artifacts)
+                messagebox.showinfo("Success", f"Finished. Files produced:\n{files}")
             except Exception as e:
                 self.log(f"ERROR: {e}")
                 messagebox.showerror("Error", str(e))
@@ -1989,7 +2059,9 @@ def main() -> None:
 
     if args.zip_path and args.out_dir:
         res = process_zip_to_folder_and_pdf(Path(args.zip_path), Path(args.out_dir), project_override=args.project, log=print)
-        print(f"PDF: {res.pdf_path}")
+        print("Files produced:")
+        for artifact in res.generated_artifacts:
+            print(artifact)
         return
 
     # default to GUI
