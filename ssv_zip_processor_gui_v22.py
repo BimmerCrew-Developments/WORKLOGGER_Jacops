@@ -34,6 +34,7 @@ import re
 import shutil
 import sys
 import tempfile
+import uuid
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -262,6 +263,34 @@ def fmt_epoch(value: str) -> str:
 # Project list persistence (GUI dropdown)
 # =========================
 
+CONFIG_VERSION = 2
+DEFAULT_EXPORT_TEMPLATE_ID = "werklogger-report-v1"
+
+
+@dataclass
+class ProjectRecord:
+    id: str
+    display_name: str
+    default_template_id: Optional[str] = None
+
+
+@dataclass
+class TemplateRecord:
+    id: str
+    display_name: str
+
+
+@dataclass
+class AppConfig:
+    version: int
+    projects: List[ProjectRecord]
+    templates: List[TemplateRecord]
+
+
+DEFAULT_TEMPLATES = [
+    TemplateRecord(DEFAULT_EXPORT_TEMPLATE_ID, "Werklogger report"),
+]
+
 DEFAULT_PROJECTS: list[str] = [
     "MRO_ARDOOIE_01",
     "MRO_ARDOOIE_02",
@@ -335,41 +364,94 @@ def _project_store_path() -> Path:
     return p
 
 
-def load_projects() -> list[str]:
-    projects = list(DEFAULT_PROJECTS)
+def _stable_project_id(display_name: str) -> str:
+    """Return the same ID for a project name on every installation."""
+    return "project-" + uuid.uuid5(uuid.NAMESPACE_URL, "ssv-project:" + display_name).hex
+
+
+def _default_project_records() -> List[ProjectRecord]:
+    return [ProjectRecord(_stable_project_id(name), name) for name in DEFAULT_PROJECTS]
+
+
+def _config_to_json(config: AppConfig) -> dict:
+    return {
+        "version": CONFIG_VERSION,
+        "projects": [
+            {
+                "id": project.id,
+                "display_name": project.display_name,
+                "default_template_id": project.default_template_id,
+            }
+            for project in config.projects
+        ],
+        "templates": [
+            {"id": template.id, "display_name": template.display_name}
+            for template in config.templates
+        ],
+    }
+
+
+def load_projects() -> AppConfig:
+    """Load the versioned configuration and migrate the legacy name list."""
+    projects = _default_project_records()
+    templates = list(DEFAULT_TEMPLATES)
     p = _project_store_path()
+    migrated = False
     try:
         if p.exists():
             data = json.loads(p.read_text(encoding="utf-8"))
+            # v1 was simply a JSON list containing custom project names.
             if isinstance(data, list):
                 for item in data:
                     if isinstance(item, str) and item.strip():
-                        projects.append(item.strip())
+                        name = item.strip()
+                        projects.append(ProjectRecord(_stable_project_id(name), name))
+                migrated = True
+            elif isinstance(data, dict):
+                for item in data.get("projects", []):
+                    if not isinstance(item, dict) or not str(item.get("display_name", "")).strip():
+                        continue
+                    name = str(item["display_name"]).strip()
+                    projects.append(ProjectRecord(
+                        str(item.get("id") or _stable_project_id(name)),
+                        name,
+                        str(item["default_template_id"]) if item.get("default_template_id") else None,
+                    ))
+                loaded_templates = []
+                for item in data.get("templates", []):
+                    if isinstance(item, dict) and item.get("id") and item.get("display_name"):
+                        loaded_templates.append(TemplateRecord(str(item["id"]), str(item["display_name"])))
+                if loaded_templates:
+                    templates = loaded_templates
     except Exception:
         # Ignore malformed config; keep defaults
         pass
-    # Deduplicate while preserving order
-    out: list[str] = []
+    # Deduplicate by ID while preserving order. User records replace bundled ones,
+    # which lets a saved default template augment a bundled project.
+    by_id = {project.id: project for project in projects}
+    out: List[ProjectRecord] = []
     seen = set()
-    for x in projects:
-        if x not in seen:
-            out.append(x)
-            seen.add(x)
-    return out
+    for project in projects:
+        if project.id not in seen:
+            out.append(by_id[project.id])
+            seen.add(project.id)
+    config = AppConfig(CONFIG_VERSION, out, templates)
+    if migrated:
+        save_projects(config)
+    return config
 
 
-def save_projects(custom_projects: list[str]) -> None:
-    """Save only custom additions (not the defaults)."""
-    defaults = set(DEFAULT_PROJECTS)
-    custom = [p for p in custom_projects if p and p not in defaults]
+def save_projects(config: AppConfig) -> None:
+    """Save project and export-template records as a versioned document."""
     p = _project_store_path()
+    contents = json.dumps(_config_to_json(config), ensure_ascii=False, indent=2)
     try:
-        p.write_text(json.dumps(custom, ensure_ascii=False, indent=2), encoding="utf-8")
+        p.write_text(contents, encoding="utf-8")
     except Exception:
         # If we can't write next to exe/script (permissions), fallback to user home
         try:
             home_p = Path.home() / ".ssv_zip_processor_projects.json"
-            home_p.write_text(json.dumps(custom, ensure_ascii=False, indent=2), encoding="utf-8")
+            home_p.write_text(contents, encoding="utf-8")
         except Exception:
             pass
 
@@ -1218,7 +1300,13 @@ def create_output_zip(out_zip_path: Path, files: List[Tuple[Path, str]]) -> None
 
 
 
-def build_pdf(out_pdf_path: Path, report: ReportRow) -> None:
+def build_pdf(
+    out_pdf_path: Path,
+    report: ReportRow,
+    export_template_id: str = DEFAULT_EXPORT_TEMPLATE_ID,
+) -> None:
+    if export_template_id != DEFAULT_EXPORT_TEMPLATE_ID:
+        raise ValueError(f"Unknown export template ID: {export_template_id}")
     c = Canvas(str(out_pdf_path), pagesize=A4)
     render_page1(c, report)
     c.showPage()
@@ -1229,7 +1317,13 @@ def build_pdf(out_pdf_path: Path, report: ReportRow) -> None:
 # =========================
 # Image processing + report building
 # =========================
-def process_zip_to_folder_and_pdf(zip_path: Path, out_dir: Path, project_override: Optional[str] = None, log: Optional[callable] = None) -> ProcessResult:
+def process_zip_to_folder_and_pdf(
+    zip_path: Path,
+    out_dir: Path,
+    project_override: Optional[str] = None,
+    log: Optional[callable] = None,
+    export_template_id: str = DEFAULT_EXPORT_TEMPLATE_ID,
+) -> ProcessResult:
     def _log(msg: str) -> None:
         if log:
             log(msg)
@@ -1345,7 +1439,7 @@ def process_zip_to_folder_and_pdf(zip_path: Path, out_dir: Path, project_overrid
         pdf_path = out_dir / fn
 
         _log("Generating PDF...")
-        build_pdf(pdf_path, report)
+        build_pdf(pdf_path, report, export_template_id)
         _log(f"Saved PDF: {pdf_path.name}")
 
         # Create output ZIP containing: generated report PDF, processed JPEGs, and any input PDF attachments.
@@ -1394,16 +1488,31 @@ if tk is not None:
             proj_row.pack(fill="x", pady=(10, 0))
             tk.Label(proj_row, text="Project/Locatie Naam:", width=22, anchor="w").pack(side="left")
 
-            self.projects = load_projects()
+            self.config = load_projects()
+            self.projects = self.config.projects
+            self.project_by_name = {p.display_name: p for p in self.projects}
             self.project_var = tk.StringVar(value="")
             self.cmb_project = ttk.Combobox(
                 proj_row,
                 textvariable=self.project_var,
-                values=([''] + self.projects),
+                values=([''] + [p.display_name for p in self.projects]),
                 state="readonly",
                 width=32,
             )
             self.cmb_project.pack(side="left", padx=(0, 10))
+            self.cmb_project.bind("<<ComboboxSelected>>", self.on_project_selected)
+
+            tk.Label(proj_row, text="Export template:", anchor="w").pack(side="left")
+            self.template_by_name = {t.display_name: t for t in self.config.templates}
+            self.template_var = tk.StringVar(value=self.config.templates[0].display_name)
+            self.cmb_template = ttk.Combobox(
+                proj_row,
+                textvariable=self.template_var,
+                values=[t.display_name for t in self.config.templates],
+                state="readonly",
+                width=24,
+            )
+            self.cmb_template.pack(side="left", padx=(6, 10))
 
             self.new_project_var = tk.StringVar()
             tk.Entry(proj_row, textvariable=self.new_project_var, width=26).pack(side="left")
@@ -1438,13 +1547,26 @@ if tk is not None:
             name = re.sub(r"_+", "_", name).strip("._ ")
             if not name:
                 return
-            if name not in self.projects:
-                self.projects.append(name)
-                self.cmb_project["values"] = ([""] + self.projects)
-                save_projects(self.projects)
+            if name not in self.project_by_name:
+                selected_template = self.template_by_name[self.template_var.get()]
+                project = ProjectRecord(_stable_project_id(name), name, selected_template.id)
+                self.projects.append(project)
+                self.project_by_name[name] = project
+                self.cmb_project["values"] = ([""] + [p.display_name for p in self.projects])
+                save_projects(self.config)
             self.project_var.set(name)
             self.new_project_var.set("")
             self.log(f"Project added/selected: {name}")
+
+        def on_project_selected(self, _event: object = None) -> None:
+            """Apply a project's default without locking the per-export choice."""
+            project = self.project_by_name.get(self.project_var.get())
+            template_id = project.default_template_id if project else None
+            if not template_id:
+                template_id = DEFAULT_EXPORT_TEMPLATE_ID
+            template = next((t for t in self.config.templates if t.id == template_id), None)
+            if template:
+                self.template_var.set(template.display_name)
 
         def pick_zip(self) -> None:
             path = filedialog.askopenfilename(title="Select input ZIP", filetypes=[("ZIP files", "*.zip")])
@@ -1473,7 +1595,14 @@ if tk is not None:
             self.btn_run.config(state="disabled")
             try:
                 self.log("Starting processing...")
-                res = process_zip_to_folder_and_pdf(self.zip_path, self.out_dir, project_override=self.project_var.get(), log=self.log)
+                template = self.template_by_name[self.template_var.get()]
+                res = process_zip_to_folder_and_pdf(
+                    self.zip_path,
+                    self.out_dir,
+                    project_override=self.project_var.get(),
+                    export_template_id=template.id,
+                    log=self.log,
+                )
                 self.log(f"Done. Images written: {res.written_images}")
                 messagebox.showinfo("Success", f"Finished.\nImages: {res.written_images}\nPDF: {res.pdf_path.name}")
             except Exception as e:
@@ -1492,10 +1621,22 @@ def main() -> None:
     ap.add_argument("--zip", dest="zip_path", help="Path to input ZIP")
     ap.add_argument("--out", dest="out_dir", help="Output folder path")
     ap.add_argument("--project", dest="project", help="Override Project/Locatie Naam")
+    ap.add_argument(
+        "--export-template",
+        default=DEFAULT_EXPORT_TEMPLATE_ID,
+        choices=[template.id for template in DEFAULT_TEMPLATES],
+        help="Stable export template ID (default: %(default)s)",
+    )
     args = ap.parse_args()
 
     if args.zip_path and args.out_dir:
-        res = process_zip_to_folder_and_pdf(Path(args.zip_path), Path(args.out_dir), project_override=args.project, log=print)
+        res = process_zip_to_folder_and_pdf(
+            Path(args.zip_path),
+            Path(args.out_dir),
+            project_override=args.project,
+            export_template_id=args.export_template,
+            log=print,
+        )
         print(f"PDF: {res.pdf_path}")
         return
 
