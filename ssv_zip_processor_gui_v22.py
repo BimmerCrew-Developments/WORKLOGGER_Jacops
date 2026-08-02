@@ -35,9 +35,9 @@ import shutil
 import sys
 import tempfile
 import zipfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Set, Tuple
 
 # GUI (optional at import time; required for desktop use)
 try:
@@ -109,6 +109,96 @@ class ReportRow:
     gebruikte_materialen_lines: List[str]
     post_afmeldingen_lines: List[str]
     photos: List[Photo]
+
+
+@dataclass(frozen=True)
+class ExportTemplate:
+    """Declarative PDF export layout.
+
+    ``template_id`` is stable and suitable for persisted preferences.  The mapping
+    fields deliberately keep the model forwards-compatible: an installation can
+    add a layout value without changing CSV ingestion or the report data model.
+    """
+
+    template_id: str
+    display_name: str
+    page_settings: Mapping[str, Any]
+    branding: Mapping[str, Any]
+    colors: Mapping[str, Tuple[float, float, float]]
+    enabled_sections: Tuple[str, ...]
+    section_order: Tuple[str, ...]
+    field_labels: Mapping[str, str]
+    photo_grid: Mapping[str, Any]
+    output_filename_pattern: str
+    layout: Mapping[str, Any] = field(default_factory=dict)
+
+
+# This is the compatibility template.  Its values are the measurements and copy
+# used by the original WERKLOGGER renderer.
+WERKLOGGER_EXPORT_TEMPLATE = ExportTemplate(
+    template_id="werklogger-report-v1",
+    display_name="WERKLOGGER RAPPORT",
+    page_settings={"pagesize": A4, "bottom_y": 70.0},
+    branding={"report_title": "WERKLOGGER RAPPORT", "photo_title": "Foto's"},
+    colors={
+        "primary": (0.702, 0.0, 0.0), "secondary": (0.549, 0.427, 0.0),
+        "status_bar": (0.83, 0.93, 0.85), "status_yes": (0.2, 0.6, 0.2),
+    },
+    enabled_sections=("address", "lmra", "work_details", "materials", "post_registrations", "photos"),
+    section_order=("address", "lmra", "work_details", "materials", "post_registrations", "photos"),
+    field_labels={
+        "address": "Adresgegevens:", "subcontractor": "Naam Onderaannemer:",
+        "project": "Project/Locatie Naam:", "building_id": "Building ID:",
+        "street_address": "Adres:", "postal_city": "Postcode + Stad:",
+        "contact": "Contactpersoon:", "quadrant": "Quadrant:",
+        "lmra": "LMRA Checklist:", "work_details": "Uitgevoerde Werken - Details:",
+        "duct_color": "Gekoppelde kleur duct:", "units_welded": "Hoeveel units gelast:",
+        "materials": "Gebruikte materialen:", "post_registrations": "Post Afmeldingen:",
+    },
+    photo_grid={
+        "columns": 2, "rows": 3, "left": 56.6929, "right": 538.5827,
+        "column_gap": 28.3464, "box_height": 170.0787, "row_top": 745.5118,
+        "row_step": 198.4252, "label_offset": 12.1102,
+        "heading_y": 782.30, "underline_y": 773.8585,
+    },
+    output_filename_pattern="{building_id}-{project_name}-{report_datetime}-RAPPORT.pdf",
+    layout={
+        "left": 56.6929, "right": 538.5827, "line_width": 1.4173,
+        "banner_y": 771.0236, "banner_height": 42.5197, "title_y": 784.72,
+        "datetime_y": 791.63, "address_value_x": 198.4252,
+        "details_value_x": 240.9449, "checklist_yes_x": 497.5433,
+        "line_spacing": 17.0079,
+    },
+)
+
+
+def resolve_export_template(template: Optional[ExportTemplate]) -> ExportTemplate:
+    """Return a usable template, falling back atomically to the built-in one."""
+    if not isinstance(template, ExportTemplate):
+        return WERKLOGGER_EXPORT_TEMPLATE
+    required_sections = {"address", "lmra", "work_details", "materials", "post_registrations", "photos"}
+    required_layout = set(WERKLOGGER_EXPORT_TEMPLATE.layout)
+    required_labels = set(WERKLOGGER_EXPORT_TEMPLATE.field_labels)
+    required_colors = set(WERKLOGGER_EXPORT_TEMPLATE.colors)
+    required_grid = set(WERKLOGGER_EXPORT_TEMPLATE.photo_grid)
+    try:
+        valid = (
+            bool(template.template_id and template.display_name and template.output_filename_pattern)
+            and set(template.enabled_sections).issubset(required_sections)
+            and len(template.section_order) == len(set(template.section_order))
+            and set(template.enabled_sections) == set(template.section_order)
+            and bool(template.page_settings.get("pagesize"))
+            and "bottom_y" in template.page_settings
+            and required_layout.issubset(template.layout)
+            and required_labels.issubset(template.field_labels)
+            and required_colors.issubset(template.colors)
+            and required_grid.issubset(template.photo_grid)
+            and int(template.photo_grid["columns"]) > 0
+            and int(template.photo_grid["rows"]) > 0
+        )
+    except (AttributeError, TypeError, ValueError):
+        valid = False
+    return template if valid else WERKLOGGER_EXPORT_TEMPLATE
 
 
 @dataclass
@@ -854,7 +944,7 @@ def _draw_kv_lines(c: Canvas, x_label: float, x_val: float, y: float, items: Lis
     return y
 
 
-def render_page1(c: Canvas, report: ReportRow) -> None:
+def render_page1(c: Canvas, report: ReportRow, template: Optional[ExportTemplate] = None) -> None:
     """
     Render the first report page to match the reference PDF layout (A4).
 
@@ -863,34 +953,31 @@ def render_page1(c: Canvas, report: ReportRow) -> None:
     - Designed to match visually; if lists grow beyond the reserved space, they will be clipped.
       (Photos always start on the next page.)
     """
-    w, h = A4
-
-    # Reference-derived coordinates (points)
-    X_LEFT = 56.6929
-    X_RIGHT = 538.5827
-
-    # Colors from reference PDF vectors
-    RED = (0.702, 0.0, 0.0)
-    GOLD = (0.549, 0.427, 0.0)
-    GREEN_BAR = (0.83, 0.93, 0.85)
-    YES_GREEN = (0.2, 0.6, 0.2)
-
-    LINE_W = 1.4173
+    template = resolve_export_template(template)
+    w, h = template.page_settings["pagesize"]
+    layout = template.layout
+    labels = template.field_labels
+    X_LEFT, X_RIGHT = layout["left"], layout["right"]
+    RED, GOLD = template.colors["primary"], template.colors["secondary"]
+    GREEN_BAR, YES_GREEN = template.colors["status_bar"], template.colors["status_yes"]
+    LINE_W = layout["line_width"]
 
     # Header banner
-    banner_y0 = 771.0236
-    banner_h = 42.5197
+    banner_y0 = layout["banner_y"]
+    banner_h = layout["banner_height"]
     c.setFillColorRGB(*RED)
     c.rect(0, banner_y0, w, banner_h, stroke=0, fill=1)
 
     # Title (black) + datetime (white, right-aligned)
     c.setFillColorRGB(0, 0, 0)
     c.setFont("Helvetica-Bold", 16)
-    c.drawString(X_LEFT, 784.72, "WERKLOGGER RAPPORT")
+    c.drawString(X_LEFT, layout["title_y"], template.branding["report_title"])
 
     c.setFillColorRGB(1, 1, 1)
     c.setFont("Helvetica-Bold", 10)
-    c.drawRightString(X_RIGHT, 791.63, report.report_datetime)
+    c.drawRightString(X_RIGHT, layout["datetime_y"], report.report_datetime)
+
+    dy = layout["line_spacing"]
 
     # Helper: section title + underline
     def draw_section(title: str, y_title: float, line_y: float, color: Tuple[float, float, float]) -> None:
@@ -902,87 +989,89 @@ def render_page1(c: Canvas, report: ReportRow) -> None:
         c.line(X_LEFT, line_y, X_RIGHT, line_y)
         c.setFillColorRGB(0, 0, 0)
 
-    # ======================
-    # Adresgegevens
-    # ======================
-    draw_section("Adresgegevens:", y_title=739.78, line_y=731.34, color=RED)
+    if "address" in template.enabled_sections:
+        # ======================
+        # Adresgegevens
+        # ======================
+        draw_section(labels["address"], y_title=739.78, line_y=731.34, color=RED)
 
-    addr_x_val = 198.4252
-    y = 715.0956
-    dy = 17.0079
+        addr_x_val = layout["address_value_x"]
+        y = 715.0956
 
-    addr_items = [
-        ("Naam Onderaannemer:", report.naam_onderaannemer),
-        ("Project/Locatie Naam:", report.project_locatie_naam),
-        ("Building ID:", report.building_id),
-        ("Adres:", report.adres),
-        ("Postcode + Stad:", report.postcode_stad),
-        ("Contactpersoon:", report.contactpersoon),
-        ("Quadrant:", report.quadrant),
-    ]
+        addr_items = [
+            (labels["subcontractor"], report.naam_onderaannemer),
+            (labels["project"], report.project_locatie_naam),
+            (labels["building_id"], report.building_id),
+            (labels["street_address"], report.adres),
+            (labels["postal_city"], report.postcode_stad),
+            (labels["contact"], report.contactpersoon),
+            (labels["quadrant"], report.quadrant),
+        ]
 
-    for k, v in addr_items:
-        c.setFont("Helvetica-Bold", 10)
-        c.drawString(X_LEFT, y, k)
-        c.setFont("Helvetica", 10)
-        c.drawString(addr_x_val, y, v or "")
-        y -= dy
+        for k, v in addr_items:
+            c.setFont("Helvetica-Bold", 10)
+            c.drawString(X_LEFT, y, k)
+            c.setFont("Helvetica", 10)
+            c.drawString(addr_x_val, y, v or "")
+            y -= dy
 
-    # ======================
-    # LMRA Checklist
-    # ======================
-    draw_section("LMRA Checklist:", y_title=581.04, line_y=572.60, color=RED)
+    if "lmra" in template.enabled_sections:
+        # ======================
+        # LMRA Checklist
+        # ======================
+        draw_section(labels["lmra"], y_title=581.04, line_y=572.60, color=RED)
 
-    # Status bar
-    bar_y0 = 538.5827
-    bar_h = 19.8425
-    c.setFillColorRGB(*GREEN_BAR)
-    c.rect(X_LEFT, bar_y0, X_RIGHT - X_LEFT, bar_h, stroke=0, fill=1)
+        # Status bar
+        bar_y0 = 538.5827
+        bar_h = 19.8425
+        c.setFillColorRGB(*GREEN_BAR)
+        c.rect(X_LEFT, bar_y0, X_RIGHT - X_LEFT, bar_h, stroke=0, fill=1)
 
-    c.setFillColorRGB(0, 0, 0)
-    c.setFont("Helvetica", 11)
-    c.drawCentredString((X_LEFT + X_RIGHT) / 2.0, bar_y0 + 5.0, "LMRA Status: OK - Werk kan worden uitgevoerd")
-
-    # Checklist rows
-    checklist_x_yes = 497.5433
-    checklist_items = [
-        "Veiligheidsrisico's geïdentificeerd",
-        "Juiste PBM aanwezig",
-        "Werknemers geïnformeerd",
-        "Noodprocedures bekend",
-        "Werkgebied afgezet",
-        "Vergunningen aanwezig",
-    ]
-    y = 522.3386
-    for item in checklist_items:
         c.setFillColorRGB(0, 0, 0)
-        c.setFont("Helvetica-Bold", 10)
-        c.drawString(X_LEFT, y, item)
+        c.setFont("Helvetica", 11)
+        c.drawCentredString((X_LEFT + X_RIGHT) / 2.0, bar_y0 + 5.0, "LMRA Status: OK - Werk kan worden uitgevoerd")
 
-        c.setFillColorRGB(*YES_GREEN)
-        c.setFont("Helvetica-Bold", 10)
-        c.drawString(checklist_x_yes, y, "JA")
-        y -= dy
+        # Checklist rows
+        checklist_x_yes = layout["checklist_yes_x"]
+        checklist_items = [
+            "Veiligheidsrisico's geïdentificeerd",
+            "Juiste PBM aanwezig",
+            "Werknemers geïnformeerd",
+            "Noodprocedures bekend",
+            "Werkgebied afgezet",
+            "Vergunningen aanwezig",
+        ]
+        y = 522.3386
+        for item in checklist_items:
+            c.setFillColorRGB(0, 0, 0)
+            c.setFont("Helvetica-Bold", 10)
+            c.drawString(X_LEFT, y, item)
 
-    c.setFillColorRGB(0, 0, 0)
+            c.setFillColorRGB(*YES_GREEN)
+            c.setFont("Helvetica-Bold", 10)
+            c.drawString(checklist_x_yes, y, "JA")
+            y -= dy
 
-    # ======================
-    # Uitgevoerde Werken - Details
-    # ======================
-    draw_section("Uitgevoerde Werken - Details:", y_title=405.29, line_y=396.85, color=RED)
+        c.setFillColorRGB(0, 0, 0)
 
-    details_x_val = 240.9449
-    y = 380.6142
-    details_items = [
-        ("Gekoppelde kleur duct:", report.duct_kleur),
-        ("Hoeveel units gelast:", report.units_gelast),
-    ]
-    for k, v in details_items:
-        c.setFont("Helvetica-Bold", 10)
-        c.drawString(X_LEFT, y, k)
-        c.setFont("Helvetica", 10)
-        c.drawString(details_x_val, y, v or "")
-        y -= dy
+    if "work_details" in template.enabled_sections:
+        # ======================
+        # Uitgevoerde Werken - Details
+        # ======================
+        draw_section(labels["work_details"], y_title=405.29, line_y=396.85, color=RED)
+
+        details_x_val = layout["details_value_x"]
+        y = 380.6142
+        details_items = [
+            (labels["duct_color"], report.duct_kleur),
+            (labels["units_welded"], report.units_gelast),
+        ]
+        for k, v in details_items:
+            c.setFont("Helvetica-Bold", 10)
+            c.drawString(X_LEFT, y, k)
+            c.setFont("Helvetica", 10)
+            c.drawString(details_x_val, y, v or "")
+            y -= dy
     # ======================
     # Gebruikte materialen + Post Afmeldingen (paginated)
     # ======================
@@ -994,7 +1083,7 @@ def render_page1(c: Canvas, report: ReportRow) -> None:
 
     TITLE_TO_LINE = 8.45
     TITLE_TO_TEXT = 24.6898
-    BOTTOM_Y = 70.0
+    BOTTOM_Y = template.page_settings["bottom_y"]
     GAP_AFTER_SECTION = 14.0
 
     def draw_header_only() -> None:
@@ -1003,9 +1092,9 @@ def render_page1(c: Canvas, report: ReportRow) -> None:
         c.rect(0, banner_y0, w, banner_h, stroke=0, fill=1)
         c.setFillColorRGB(1, 1, 1)
         c.setFont("Helvetica-Bold", 16)
-        c.drawString(X_LEFT, 784.72, "WERKLOGGER RAPPORT")
+        c.drawString(X_LEFT, layout["title_y"], template.branding["report_title"])
         c.setFont("Helvetica-Bold", 10)
-        c.drawRightString(X_RIGHT, 791.63, report.report_datetime)
+        c.drawRightString(X_RIGHT, layout["datetime_y"], report.report_datetime)
         c.setFillColorRGB(0, 0, 0)
 
     def draw_bullet_lines(lines: list[str], y_start: float) -> tuple[list[str], float]:
@@ -1032,14 +1121,17 @@ def render_page1(c: Canvas, report: ReportRow) -> None:
     work_lines = list(report.post_afmeldingen_lines or ["-"])
 
     on_first_page = True
-    mat_title = "Gebruikte materialen:"
+    mat_title = labels["materials"]
     mat_y_title = 334.43
     mat_y_text = 309.7402
 
     while True:
-        draw_section(mat_title, y_title=mat_y_title, line_y=mat_y_title - TITLE_TO_LINE, color=GOLD)
-        c.setFont("Helvetica", 10)
-        mat_remaining, y_after_mat = draw_bullet_lines(mat_lines, mat_y_text)
+        if "materials" in template.enabled_sections:
+            draw_section(mat_title, y_title=mat_y_title, line_y=mat_y_title - TITLE_TO_LINE, color=GOLD)
+            c.setFont("Helvetica", 10)
+            mat_remaining, y_after_mat = draw_bullet_lines(mat_lines, mat_y_text)
+        else:
+            mat_remaining, y_after_mat = [], 358.0
         if not mat_remaining:
             break
         # continue on a new page
@@ -1052,7 +1144,7 @@ def render_page1(c: Canvas, report: ReportRow) -> None:
         mat_lines = mat_remaining
 
     # Render work/post sections; start below materials if needed
-    post_title = "Post Afmeldingen:"
+    post_title = labels["post_registrations"]
     fixed_post_y_title = 244.09
 
     def ensure_space_for_section(y_title: float) -> bool:
@@ -1075,9 +1167,12 @@ def render_page1(c: Canvas, report: ReportRow) -> None:
     post_lines = work_lines
 
     while True:
-        draw_section(post_title, y_title=post_y_title, line_y=post_y_title - TITLE_TO_LINE, color=GOLD)
-        c.setFont("Helvetica", 10)
-        post_remaining, y_after_post = draw_bullet_lines(post_lines, post_y_text)
+        if "post_registrations" in template.enabled_sections:
+            draw_section(post_title, y_title=post_y_title, line_y=post_y_title - TITLE_TO_LINE, color=GOLD)
+            c.setFont("Helvetica", 10)
+            post_remaining, y_after_post = draw_bullet_lines(post_lines, post_y_text)
+        else:
+            post_remaining, y_after_post = [], post_y_text
         if not post_remaining:
             break
         c.showPage()
@@ -1090,33 +1185,27 @@ def render_page1(c: Canvas, report: ReportRow) -> None:
 
 
 
-def render_photos_pages(c: Canvas, report: ReportRow) -> None:
+def render_photos_pages(c: Canvas, report: ReportRow, template: Optional[ExportTemplate] = None) -> None:
     """Render photo pages matching the reference layout (2 columns, 3 rows per page)."""
-    w, h = A4
-
-    X_LEFT = 56.6929
-    X_RIGHT = 538.5827
-    RED = (0.702, 0.0, 0.0)
-    LINE_W = 1.4173
-
-    # Heading positions from reference
-    heading_y = 782.30
-    underline_y = 773.8585
-
-    # Image boxes from reference (points)
-    col1_x0, col1_x1 = 56.6929, 283.4646
-    col2_x0, col2_x1 = 311.8110, 538.5827
-    box_w = col1_x1 - col1_x0
-    box_h = 170.0787
-
-    row_top_start = 745.5118
-    row_step = 198.4252  # box_h + vertical gap (~28.35)
-    label_offset = 12.1102  # label baseline above first row images
+    template = resolve_export_template(template)
+    w, h = template.page_settings["pagesize"]
+    grid, layout = template.photo_grid, template.layout
+    X_LEFT, X_RIGHT = grid["left"], grid["right"]
+    RED, LINE_W = template.colors["primary"], layout["line_width"]
+    heading_y, underline_y = grid["heading_y"], grid["underline_y"]
+    columns = int(grid["columns"])
+    gap = grid["column_gap"]
+    box_w = (X_RIGHT - X_LEFT - gap * (columns - 1)) / columns
+    column_boxes = [(X_LEFT + i * (box_w + gap), X_LEFT + i * (box_w + gap) + box_w) for i in range(columns)]
+    box_h = grid["box_height"]
+    row_top_start, row_step = grid["row_top"], grid["row_step"]
+    label_offset = grid["label_offset"]
+    rows_per_page = int(grid["rows"])
 
     def draw_page_heading(first: bool) -> None:
         c.setFillColorRGB(*RED)
         c.setFont("Helvetica", 14)
-        c.drawString(X_LEFT, heading_y, "Foto's:" if first else "Foto's (vervolg):")
+        c.drawString(X_LEFT, heading_y, f"{template.branding['photo_title']}:" if first else f"{template.branding['photo_title']} (vervolg):")
         c.setStrokeColorRGB(*RED)
         c.setLineWidth(LINE_W)
         c.line(X_LEFT, underline_y, X_RIGHT, underline_y)
@@ -1143,7 +1232,7 @@ def render_photos_pages(c: Canvas, report: ReportRow) -> None:
 
     def ensure_row_available() -> None:
         nonlocal row_index, first_page
-        if row_index >= 3:
+        if row_index >= rows_per_page:
             c.showPage()
             draw_page_heading(False)
             row_index = 0
@@ -1170,8 +1259,7 @@ def render_photos_pages(c: Canvas, report: ReportRow) -> None:
                 c.drawString(X_LEFT, label_y, f"{label} ({len(photos)})")
                 label_printed_on_this_page = True
 
-            left_photo = remaining.pop(0) if remaining else None
-            right_photo = remaining.pop(0) if remaining else None
+            row_photos = [remaining.pop(0) if remaining else None for _ in range(columns)]
 
             def draw_photo(photo: Optional[Photo], x0: float, x1: float) -> None:
                 if not photo or not photo.image_path or not photo.image_path.exists():
@@ -1197,13 +1285,13 @@ def render_photos_pages(c: Canvas, report: ReportRow) -> None:
                 except Exception:
                     return
 
-            draw_photo(left_photo, col1_x0, col1_x1)
-            draw_photo(right_photo, col2_x0, col2_x1)
+            for photo, (x0, x1) in zip(row_photos, column_boxes):
+                draw_photo(photo, x0, x1)
 
             row_index += 1
 
             # If the group continues onto a new page, allow label to repeat.
-            if row_index >= 3 and remaining:
+            if row_index >= rows_per_page and remaining:
                 label_printed_on_this_page = False
 
 
@@ -1218,18 +1306,23 @@ def create_output_zip(out_zip_path: Path, files: List[Tuple[Path, str]]) -> None
 
 
 
-def build_pdf(out_pdf_path: Path, report: ReportRow) -> None:
-    c = Canvas(str(out_pdf_path), pagesize=A4)
-    render_page1(c, report)
-    c.showPage()
-    render_photos_pages(c, report)
+def build_pdf(out_pdf_path: Path, report: ReportRow, template: Optional[ExportTemplate] = None) -> None:
+    template = resolve_export_template(template)
+    c = Canvas(str(out_pdf_path), pagesize=template.page_settings["pagesize"])
+    non_photo_sections = [s for s in template.section_order if s != "photos" and s in template.enabled_sections]
+    if non_photo_sections:
+        render_page1(c, report, template)
+    if "photos" in template.enabled_sections and report.photos:
+        if non_photo_sections:
+            c.showPage()
+        render_photos_pages(c, report, template)
     c.save()
 
 
 # =========================
 # Image processing + report building
 # =========================
-def process_zip_to_folder_and_pdf(zip_path: Path, out_dir: Path, project_override: Optional[str] = None, log: Optional[callable] = None) -> ProcessResult:
+def process_zip_to_folder_and_pdf(zip_path: Path, out_dir: Path, project_override: Optional[str] = None, log: Optional[callable] = None, template: Optional[ExportTemplate] = None) -> ProcessResult:
     def _log(msg: str) -> None:
         if log:
             log(msg)
@@ -1340,12 +1433,26 @@ def process_zip_to_folder_and_pdf(zip_path: Path, out_dir: Path, project_overrid
 
         report.photos = processed_photos
 
-        # Output PDF name
-        fn = f"{safe_filename(report.building_id)}-{safe_filename(report.project_locatie_naam)}-{safe_filename(report.report_datetime)}-RAPPORT.pdf"
+        # Output naming is presentation configuration; CSV parsing remains template-independent.
+        template = resolve_export_template(template)
+        try:
+            fn = template.output_filename_pattern.format(
+                building_id=safe_filename(report.building_id),
+                project_name=safe_filename(report.project_locatie_naam),
+                report_datetime=safe_filename(report.report_datetime),
+            )
+            fn = safe_filename(Path(fn).stem) + ".pdf"
+        except (KeyError, ValueError, IndexError):
+            template = WERKLOGGER_EXPORT_TEMPLATE
+            fn = template.output_filename_pattern.format(
+                building_id=safe_filename(report.building_id),
+                project_name=safe_filename(report.project_locatie_naam),
+                report_datetime=safe_filename(report.report_datetime),
+            )
         pdf_path = out_dir / fn
 
         _log("Generating PDF...")
-        build_pdf(pdf_path, report)
+        build_pdf(pdf_path, report, template)
         _log(f"Saved PDF: {pdf_path.name}")
 
         # Create output ZIP containing: generated report PDF, processed JPEGs, and any input PDF attachments.
