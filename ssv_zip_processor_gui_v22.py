@@ -620,56 +620,100 @@ DEFAULT_PROJECTS: list[str] = [
 ]
 
 
-def _project_store_path() -> Path:
-    """Prefer a local projects.json next to the script/exe, fallback to user home."""
+PROJECT_CONFIG_VERSION = 1
+
+
+class ProjectConfigurationError(RuntimeError):
+    """A project configuration could not be safely read or written."""
+
+
+def project_config_path() -> Path:
+    """Return the platform-appropriate, per-user project configuration file."""
+    if sys.platform == "win32":
+        root = Path(os.environ.get("APPDATA") or Path.home() / "AppData" / "Roaming")
+        return root / "SSV ZIP Processor" / "projects.json"
+    if sys.platform == "darwin":
+        return Path.home() / "Library" / "Application Support" / "SSV ZIP Processor" / "projects.json"
+    root = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config")
+    return root / "ssv-zip-processor" / "projects.json"
+
+
+def _legacy_project_paths() -> Tuple[Path, Path]:
+    adjacent_base = (Path(sys.executable).resolve().parent if getattr(sys, "frozen", False)
+                     else Path(__file__).resolve().parent)
+    return adjacent_base / "projects.json", Path.home() / ".ssv_zip_processor_projects.json"
+
+
+def _decode_project_config(path: Path, *, legacy: bool = False) -> List[str]:
     try:
-        base = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))  # type: ignore[attr-defined]
-    except Exception:
-        base = Path(__file__).resolve().parent
-    # When frozen, _MEIPASS is temp; store next to executable instead
-    if getattr(sys, "frozen", False):
-        base = Path(sys.executable).resolve().parent  # type: ignore[attr-defined]
-    p = base / "projects.json"
-    return p
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ProjectConfigurationError(f"Could not read project configuration {path}: {exc}") from exc
+    if legacy:
+        projects = data
+    else:
+        if (not isinstance(data, dict) or type(data.get("version")) is not int
+                or data.get("version") != PROJECT_CONFIG_VERSION):
+            version = data.get("version") if isinstance(data, dict) else None
+            raise ProjectConfigurationError(
+                f"Unsupported project configuration version {version!r} in {path}; "
+                f"expected {PROJECT_CONFIG_VERSION}."
+            )
+        projects = data.get("projects")
+    if not isinstance(projects, list) or any(not isinstance(item, str) for item in projects):
+        raise ProjectConfigurationError(f"Invalid project list in {path}.")
+    return [item.strip() for item in projects if item.strip()]
 
 
-def load_projects() -> list[str]:
-    projects = list(DEFAULT_PROJECTS)
-    p = _project_store_path()
+def _atomic_write(path: Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path: Optional[Path] = None
     try:
-        if p.exists():
-            data = json.loads(p.read_text(encoding="utf-8"))
-            if isinstance(data, list):
-                for item in data:
-                    if isinstance(item, str) and item.strip():
-                        projects.append(item.strip())
-    except Exception:
-        # Ignore malformed config; keep defaults
-        pass
-    # Deduplicate while preserving order
-    out: list[str] = []
-    seen = set()
-    for x in projects:
-        if x not in seen:
-            out.append(x)
-            seen.add(x)
-    return out
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=path.parent,
+                                         prefix=f".{path.name}.", suffix=".tmp", delete=False) as handle:
+            temp_path = Path(handle.name)
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, path)
+    finally:
+        if temp_path is not None:
+            temp_path.unlink(missing_ok=True)
 
 
-def save_projects(custom_projects: list[str]) -> None:
-    """Save only custom additions (not the defaults)."""
+def save_projects(projects: List[str]) -> None:
+    """Atomically save custom projects and back up the last valid configuration."""
     defaults = set(DEFAULT_PROJECTS)
-    custom = [p for p in custom_projects if p and p not in defaults]
-    p = _project_store_path()
+    custom = list(dict.fromkeys(item.strip() for item in projects if item.strip() and item not in defaults))
+    path = project_config_path()
     try:
-        p.write_text(json.dumps(custom, ensure_ascii=False, indent=2), encoding="utf-8")
-    except Exception:
-        # If we can't write next to exe/script (permissions), fallback to user home
-        try:
-            home_p = Path.home() / ".ssv_zip_processor_projects.json"
-            home_p.write_text(json.dumps(custom, ensure_ascii=False, indent=2), encoding="utf-8")
-        except Exception:
-            pass
+        if path.exists():
+            _decode_project_config(path)  # Never replace an invalid file or call it a valid backup.
+            _atomic_write(path.with_suffix(path.suffix + ".bak"), path.read_text(encoding="utf-8"))
+        document = {"version": PROJECT_CONFIG_VERSION, "projects": custom}
+        _atomic_write(path, json.dumps(document, ensure_ascii=False, indent=2) + "\n")
+    except (OSError, UnicodeError, ProjectConfigurationError) as exc:
+        if isinstance(exc, ProjectConfigurationError):
+            raise
+        raise ProjectConfigurationError(f"Could not write project configuration {path}: {exc}") from exc
+
+
+def load_projects() -> List[str]:
+    """Load the versioned configuration, migrating both historical locations once."""
+    path = project_config_path()
+    custom: List[str] = []
+    if path.exists():
+        custom = _decode_project_config(path)
+    else:
+        legacy_found = False
+        for legacy_path in dict.fromkeys(_legacy_project_paths()):
+            if legacy_path.exists():
+                legacy_found = True
+                custom.extend(_decode_project_config(legacy_path, legacy=True))
+        if legacy_found:
+            save_projects(custom)
+
+    return list(dict.fromkeys([*DEFAULT_PROJECTS, *custom]))
 
 
 # =========================
@@ -1929,7 +1973,11 @@ if tk is not None:
             proj_row.pack(fill="x", pady=(10, 0))
             tk.Label(proj_row, text="Project/Locatie Naam:", width=22, anchor="w").pack(side="left")
 
-            self.projects = load_projects()
+            try:
+                self.projects = load_projects()
+            except ProjectConfigurationError as exc:
+                self.projects = list(DEFAULT_PROJECTS)
+                messagebox.showerror("Project configuration error", str(exc), parent=self)
             self.project_var = tk.StringVar(value="")
             self.cmb_project = ttk.Combobox(
                 proj_row,
@@ -1984,7 +2032,14 @@ if tk is not None:
             if name not in self.projects:
                 self.projects.append(name)
                 self.cmb_project["values"] = ([""] + self.projects)
-                save_projects(self.projects)
+                try:
+                    save_projects(self.projects)
+                except ProjectConfigurationError as exc:
+                    self.projects.remove(name)
+                    self.cmb_project["values"] = ([""] + self.projects)
+                    messagebox.showerror("Project configuration error", str(exc), parent=self)
+                    self.log(f"Could not save project: {exc}")
+                    return
             self.project_var.set(name)
             self.new_project_var.set("")
             self.log(f"Project added/selected: {name}")
