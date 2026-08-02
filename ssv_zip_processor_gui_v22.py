@@ -34,6 +34,7 @@ import re
 import shutil
 import sys
 import tempfile
+import uuid
 import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -171,6 +172,103 @@ WERKLOGGER_EXPORT_TEMPLATE = ExportTemplate(
     },
 )
 
+TEMPLATE_SECTIONS = (
+    ("address", "Address"), ("lmra", "LMRA checklist"),
+    ("work_details", "Work details"), ("materials", "Materials"),
+    ("post_registrations", "Post registrations"), ("photos", "Photos"),
+)
+FILENAME_PLACEHOLDERS = frozenset({"building_id", "project_name", "report_datetime"})
+
+
+def _template_store_path() -> Path:
+    """Return the writable per-installation template store."""
+    base = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
+    return base / "export_templates.json"
+
+
+def export_template_to_dict(template: ExportTemplate) -> Dict[str, Any]:
+    """Convert a template to its portable JSON representation."""
+    return {
+        "template_id": template.template_id, "display_name": template.display_name,
+        "page_settings": dict(template.page_settings), "branding": dict(template.branding),
+        "colors": {key: list(value) for key, value in template.colors.items()},
+        "enabled_sections": list(template.enabled_sections), "section_order": list(template.section_order),
+        "field_labels": dict(template.field_labels), "photo_grid": dict(template.photo_grid),
+        "output_filename_pattern": template.output_filename_pattern, "layout": dict(template.layout),
+    }
+
+
+def export_template_from_dict(data: Mapping[str, Any]) -> ExportTemplate:
+    """Build and validate a custom template from untrusted JSON data."""
+    template = ExportTemplate(
+        template_id=str(data["template_id"]), display_name=str(data["display_name"]),
+        page_settings=dict(data["page_settings"]), branding=dict(data["branding"]),
+        colors={key: tuple(value) for key, value in dict(data["colors"]).items()},
+        enabled_sections=tuple(data["enabled_sections"]), section_order=tuple(data["section_order"]),
+        field_labels={str(k): str(v) for k, v in dict(data["field_labels"]).items()},
+        photo_grid=dict(data["photo_grid"]), output_filename_pattern=str(data["output_filename_pattern"]),
+        layout=dict(data["layout"]),
+    )
+    if resolve_export_template(template) is not template:
+        raise ValueError("Invalid export template")
+    return template
+
+
+def validate_template_values(name: str, title: str, pattern: str, colors: Mapping[str, Any],
+                             sections: List[str], rows: Any, columns: Any) -> List[str]:
+    """Return all user-facing validation errors for editable template values."""
+    errors: List[str] = []
+    if not name.strip(): errors.append("Template name is required.")
+    if not title.strip(): errors.append("Report title is required.")
+    if not pattern.strip(): errors.append("Filename pattern is required.")
+    fields = re.findall(r"{([^{}!:]+)(?:![^{}:]*)?(?::[^{}]*)?}", pattern)
+    unknown = sorted(set(fields) - FILENAME_PLACEHOLDERS)
+    if unknown: errors.append("Unknown filename placeholder(s): " + ", ".join(unknown))
+    try:
+        pattern.format(**{key: "value" for key in FILENAME_PLACEHOLDERS})
+    except (KeyError, ValueError, IndexError) as exc:
+        errors.append(f"Invalid filename pattern: {exc}")
+    if not sections: errors.append("Enable at least one section.")
+    try:
+        if int(rows) < 1 or int(columns) < 1: raise ValueError
+    except (TypeError, ValueError): errors.append("Photo rows and columns must be positive whole numbers.")
+    for key, value in colors.items():
+        if not re.fullmatch(r"#[0-9a-fA-F]{6}", str(value).strip()):
+            errors.append(f"Color {key} must use #RRGGBB format.")
+    return errors
+
+
+def load_export_templates(path: Optional[Path] = None) -> List[ExportTemplate]:
+    """Load valid custom templates; the compatibility template is always first."""
+    result = [WERKLOGGER_EXPORT_TEMPLATE]
+    try:
+        data = json.loads((path or _template_store_path()).read_text(encoding="utf-8"))
+        for item in data if isinstance(data, list) else []:
+            template = export_template_from_dict(item)
+            if template.template_id != WERKLOGGER_EXPORT_TEMPLATE.template_id:
+                result.append(template)
+    except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError):
+        pass
+    return result
+
+
+def save_export_templates(templates: List[ExportTemplate], path: Optional[Path] = None) -> None:
+    """Atomically persist custom templates, never writing the built-in template."""
+    destination = path or _template_store_path()
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    payload = [export_template_to_dict(t) for t in templates
+               if t.template_id != WERKLOGGER_EXPORT_TEMPLATE.template_id]
+    fd, temp_name = tempfile.mkstemp(prefix=destination.name + ".", suffix=".tmp", dir=str(destination.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False, indent=2)
+            handle.flush(); os.fsync(handle.fileno())
+        os.replace(temp_name, destination)
+    except Exception:
+        try: os.unlink(temp_name)
+        except OSError: pass
+        raise
+
 
 def resolve_export_template(template: Optional[ExportTemplate]) -> ExportTemplate:
     """Return a usable template, falling back atomically to the built-in one."""
@@ -186,7 +284,8 @@ def resolve_export_template(template: Optional[ExportTemplate]) -> ExportTemplat
             bool(template.template_id and template.display_name and template.output_filename_pattern)
             and set(template.enabled_sections).issubset(required_sections)
             and len(template.section_order) == len(set(template.section_order))
-            and set(template.enabled_sections) == set(template.section_order)
+            and set(template.enabled_sections).issubset(set(template.section_order))
+            and set(template.section_order).issubset(required_sections)
             and bool(template.page_settings.get("pagesize"))
             and "bottom_y" in template.page_settings
             and required_layout.issubset(template.layout)
@@ -1477,6 +1576,180 @@ def process_zip_to_folder_and_pdf(zip_path: Path, out_dir: Path, project_overrid
 # GUI
 # =========================
 if tk is not None:
+    class TemplateManagerDialog(tk.Toplevel):
+        """Editor for export presentation templates (CSV import keys stay immutable)."""
+        def __init__(self, master: "App") -> None:
+            super().__init__(master)
+            self.app = master
+            self.title("Manage export templates")
+            self.geometry("900x650")
+            self.transient(master)
+            self.templates = list(master.export_templates)
+
+            left = ttk.Frame(self, padding=8); left.pack(side="left", fill="y")
+            ttk.Label(left, text="Templates").pack(anchor="w")
+            self.template_list = tk.Listbox(left, width=28, exportselection=False)
+            self.template_list.pack(fill="y", expand=True, pady=4)
+            self.template_list.bind("<<ListboxSelect>>", self._select)
+            for text, command in (("New", self._new), ("Duplicate", self._duplicate),
+                                  ("Rename", self._rename), ("Delete", self._delete)):
+                ttk.Button(left, text=text, command=command).pack(fill="x", pady=2)
+
+            right = ttk.Frame(self, padding=8); right.pack(side="left", fill="both", expand=True)
+            self.readonly_note = ttk.Label(right, foreground="#9b0000")
+            self.readonly_note.pack(anchor="w")
+            book = ttk.Notebook(right); book.pack(fill="both", expand=True, pady=5)
+            general = ttk.Frame(book, padding=8); sections = ttk.Frame(book, padding=8)
+            labels = ttk.Frame(book, padding=8)
+            book.add(general, text="Report & photos"); book.add(sections, text="Sections")
+            book.add(labels, text="CSV-backed fields / labels")
+
+            self.name_var = tk.StringVar(); self.title_var = tk.StringVar(); self.pattern_var = tk.StringVar()
+            self.rows_var = tk.StringVar(); self.columns_var = tk.StringVar()
+            general.columnconfigure(1, weight=1)
+            fields = (("Template name", self.name_var), ("Report title", self.title_var),
+                      ("Filename pattern", self.pattern_var), ("Photo rows", self.rows_var),
+                      ("Photo columns", self.columns_var))
+            for row, (caption, variable) in enumerate(fields):
+                ttk.Label(general, text=caption).grid(row=row, column=0, sticky="w", padx=(0, 8), pady=3)
+                ttk.Entry(general, textvariable=variable).grid(row=row, column=1, sticky="ew", pady=3)
+            ttk.Label(general, text="Placeholders: {building_id}, {project_name}, {report_datetime}").grid(
+                row=5, column=1, sticky="w")
+            self.color_vars = {key: tk.StringVar() for key in WERKLOGGER_EXPORT_TEMPLATE.colors}
+            for offset, (key, variable) in enumerate(self.color_vars.items(), start=6):
+                ttk.Label(general, text=f"{key.replace('_', ' ').title()} color").grid(row=offset, column=0, sticky="w", pady=3)
+                ttk.Entry(general, textvariable=variable, width=12).grid(row=offset, column=1, sticky="w", pady=3)
+
+            self.section_vars = {key: tk.BooleanVar() for key, _ in TEMPLATE_SECTIONS}
+            for row, (key, caption) in enumerate(TEMPLATE_SECTIONS):
+                ttk.Checkbutton(sections, text=caption, variable=self.section_vars[key]).grid(row=row, column=0, sticky="w")
+            ttk.Label(sections, text="Order").grid(row=0, column=1, sticky="w", padx=(30, 0))
+            self.order_list = tk.Listbox(sections, height=9, exportselection=False)
+            self.order_list.grid(row=1, column=1, rowspan=6, padx=(30, 4), sticky="nsew")
+            moves = ttk.Frame(sections); moves.grid(row=1, column=2, sticky="n")
+            ttk.Button(moves, text="Move up", command=lambda: self._move(-1)).pack(fill="x")
+            ttk.Button(moves, text="Move down", command=lambda: self._move(1)).pack(fill="x", pady=4)
+
+            ttk.Label(labels, text="Import/report field ID (fixed)").grid(row=0, column=0, sticky="w")
+            ttk.Label(labels, text="Display label (editable)").grid(row=0, column=1, sticky="w")
+            canvas = tk.Canvas(labels, highlightthickness=0); scroll = ttk.Scrollbar(labels, command=canvas.yview)
+            label_frame = ttk.Frame(canvas); canvas.create_window((0, 0), window=label_frame, anchor="nw")
+            canvas.configure(yscrollcommand=scroll.set); canvas.grid(row=1, column=0, columnspan=2, sticky="nsew")
+            scroll.grid(row=1, column=2, sticky="ns"); labels.rowconfigure(1, weight=1); labels.columnconfigure(1, weight=1)
+            label_frame.bind("<Configure>", lambda _e: canvas.configure(scrollregion=canvas.bbox("all")))
+            self.label_vars = {key: tk.StringVar() for key in WERKLOGGER_EXPORT_TEMPLATE.field_labels}
+            for row, (key, variable) in enumerate(self.label_vars.items()):
+                ttk.Label(label_frame, text=key, width=22).grid(row=row, column=0, sticky="w", pady=2)
+                ttk.Entry(label_frame, textvariable=variable, width=42).grid(row=row, column=1, sticky="ew", pady=2)
+
+            footer = ttk.Frame(right); footer.pack(fill="x")
+            ttk.Button(footer, text="Save changes", command=self._save).pack(side="right")
+            ttk.Button(footer, text="Close", command=self.destroy).pack(side="right", padx=6)
+            self._refresh_list(0)
+
+        @staticmethod
+        def _hex(color: Tuple[float, float, float]) -> str:
+            return "#" + "".join(f"{max(0, min(255, round(component * 255))):02X}" for component in color)
+
+        def _refresh_list(self, index: int) -> None:
+            self.template_list.delete(0, "end")
+            for template in self.templates:
+                suffix = " (built-in)" if template.template_id == WERKLOGGER_EXPORT_TEMPLATE.template_id else ""
+                self.template_list.insert("end", template.display_name + suffix)
+            self.template_list.selection_set(max(0, min(index, len(self.templates) - 1))); self._load(index)
+
+        def _index(self) -> Optional[int]:
+            selection = self.template_list.curselection()
+            return selection[0] if selection else None
+
+        def _select(self, _event: Any = None) -> None:
+            index = self._index()
+            if index is not None: self._load(index)
+
+        def _load(self, index: int) -> None:
+            template = self.templates[index]; built_in = template.template_id == WERKLOGGER_EXPORT_TEMPLATE.template_id
+            self.readonly_note.config(text="Built-in compatibility template is read-only; duplicate it to customize." if built_in else "")
+            self.name_var.set(template.display_name); self.title_var.set(str(template.branding["report_title"]))
+            self.pattern_var.set(template.output_filename_pattern)
+            self.rows_var.set(str(template.photo_grid["rows"])); self.columns_var.set(str(template.photo_grid["columns"]))
+            for key, variable in self.color_vars.items(): variable.set(self._hex(template.colors[key]))
+            for key, variable in self.section_vars.items(): variable.set(key in template.enabled_sections)
+            self.order_list.delete(0, "end")
+            for section in template.section_order: self.order_list.insert("end", section)
+            for key, variable in self.label_vars.items(): variable.set(template.field_labels[key])
+
+        def _new(self) -> None:
+            self._append_copy(WERKLOGGER_EXPORT_TEMPLATE, "New template")
+
+        def _duplicate(self) -> None:
+            index = self._index()
+            if index is not None: self._append_copy(self.templates[index], self.templates[index].display_name + " copy")
+
+        def _append_copy(self, source: ExportTemplate, name: str) -> None:
+            data = export_template_to_dict(source); data["template_id"] = "custom-" + uuid.uuid4().hex
+            data["display_name"] = name; self.templates.append(export_template_from_dict(data))
+            self._refresh_list(len(self.templates) - 1)
+
+        def _rename(self) -> None:
+            index = self._index()
+            if index is None: return
+            if index == 0:
+                messagebox.showinfo("Read-only", "Duplicate the built-in template before renaming it.", parent=self); return
+            name = self.name_var.get().strip()
+            if not name:
+                messagebox.showerror("Invalid name", "Enter the new name in Template name first.", parent=self); return
+            self._save()
+
+        def _delete(self) -> None:
+            index = self._index()
+            if index is None: return
+            if self.templates[index].template_id == WERKLOGGER_EXPORT_TEMPLATE.template_id:
+                messagebox.showinfo("Read-only", "The built-in compatibility template cannot be deleted.", parent=self); return
+            if messagebox.askyesno("Delete template", f"Delete {self.templates[index].display_name}?", parent=self):
+                del self.templates[index]; save_export_templates(self.templates); self.app.set_export_templates(self.templates)
+                self._refresh_list(max(0, index - 1))
+
+        def _move(self, delta: int) -> None:
+            selection = self.order_list.curselection()
+            if not selection: return
+            old = selection[0]; new = old + delta
+            if not 0 <= new < self.order_list.size(): return
+            value = self.order_list.get(old); self.order_list.delete(old); self.order_list.insert(new, value)
+            self.order_list.selection_set(new)
+
+        def _save(self) -> None:
+            index = self._index()
+            if index is None: return
+            current = self.templates[index]
+            if current.template_id == WERKLOGGER_EXPORT_TEMPLATE.template_id:
+                messagebox.showinfo("Read-only", "Duplicate the built-in template to customize it.", parent=self); return
+            order = list(self.order_list.get(0, "end"))
+            enabled = [key for key in order if self.section_vars[key].get()]
+            errors = validate_template_values(self.name_var.get(), self.title_var.get(), self.pattern_var.get(),
+                                              {k: v.get() for k, v in self.color_vars.items()}, enabled,
+                                              self.rows_var.get(), self.columns_var.get())
+            if any(not variable.get().strip() for variable in self.label_vars.values()):
+                errors.append("All display labels are required.")
+            if any(t.display_name.casefold() == self.name_var.get().strip().casefold() and i != index
+                   for i, t in enumerate(self.templates)):
+                errors.append("Template names must be unique.")
+            if errors:
+                messagebox.showerror("Cannot save template", "\n".join(errors), parent=self); return
+            data = export_template_to_dict(current)
+            data.update(display_name=self.name_var.get().strip(), output_filename_pattern=self.pattern_var.get().strip(),
+                        enabled_sections=enabled, section_order=order)
+            data["branding"]["report_title"] = self.title_var.get().strip()
+            data["colors"] = {key: [int(value.get().strip()[i:i+2], 16) / 255 for i in (1, 3, 5)] for key, value in self.color_vars.items()}
+            data["photo_grid"].update(rows=int(self.rows_var.get()), columns=int(self.columns_var.get()))
+            data["field_labels"] = {key: variable.get().strip() for key, variable in self.label_vars.items()}
+            self.templates[index] = export_template_from_dict(data)
+            try: save_export_templates(self.templates)
+            except OSError as exc:
+                messagebox.showerror("Cannot save template", str(exc), parent=self); return
+            self.app.set_export_templates(self.templates, self.templates[index].template_id)
+            self._refresh_list(index)
+            messagebox.showinfo("Template saved", "The export template is ready to use.", parent=self)
+
     class App(tk.Tk):
         def __init__(self) -> None:
             super().__init__()
@@ -1485,6 +1758,7 @@ if tk is not None:
     
             self.zip_path: Optional[Path] = None
             self.out_dir: Optional[Path] = None
+            self.export_templates = load_export_templates()
     
             frm = tk.Frame(self)
             frm.pack(fill="x", padx=10, pady=10)
@@ -1515,6 +1789,14 @@ if tk is not None:
             self.new_project_var = tk.StringVar()
             tk.Entry(proj_row, textvariable=self.new_project_var, width=26).pack(side="left")
             tk.Button(proj_row, text="Add project", command=self.add_project).pack(side="left", padx=(8, 0))
+
+            template_row = tk.Frame(frm); template_row.pack(fill="x", pady=(8, 0))
+            tk.Label(template_row, text="Export template:", width=22, anchor="w").pack(side="left")
+            self.template_var = tk.StringVar()
+            self.cmb_template = ttk.Combobox(template_row, textvariable=self.template_var, state="readonly", width=32)
+            self.cmb_template.pack(side="left", padx=(0, 10))
+            tk.Button(template_row, text="Manage templates...", command=self.manage_templates).pack(side="left")
+            self.set_export_templates(self.export_templates)
     
             btns = tk.Frame(frm)
             btns.pack(fill="x", pady=(10, 0))
@@ -1553,6 +1835,24 @@ if tk is not None:
             self.new_project_var.set("")
             self.log(f"Project added/selected: {name}")
 
+        def set_export_templates(self, templates: List[ExportTemplate], selected_id: Optional[str] = None) -> None:
+            """Refresh template choices immediately after a management operation."""
+            old_id = selected_id
+            if old_id is None and hasattr(self, "cmb_template"):
+                current = self.template_var.get()
+                old_id = next((t.template_id for t in self.export_templates if t.display_name == current), None)
+            self.export_templates = list(templates)
+            self.cmb_template["values"] = [t.display_name for t in self.export_templates]
+            selected = next((t for t in self.export_templates if t.template_id == old_id), self.export_templates[0])
+            self.template_var.set(selected.display_name)
+
+        def manage_templates(self) -> None:
+            TemplateManagerDialog(self)
+
+        def selected_template(self) -> ExportTemplate:
+            return next((t for t in self.export_templates if t.display_name == self.template_var.get()),
+                        WERKLOGGER_EXPORT_TEMPLATE)
+
         def pick_zip(self) -> None:
             path = filedialog.askopenfilename(title="Select input ZIP", filetypes=[("ZIP files", "*.zip")])
             if not path:
@@ -1580,7 +1880,8 @@ if tk is not None:
             self.btn_run.config(state="disabled")
             try:
                 self.log("Starting processing...")
-                res = process_zip_to_folder_and_pdf(self.zip_path, self.out_dir, project_override=self.project_var.get(), log=self.log)
+                res = process_zip_to_folder_and_pdf(self.zip_path, self.out_dir, project_override=self.project_var.get(),
+                                                    log=self.log, template=self.selected_template())
                 self.log(f"Done. Images written: {res.written_images}")
                 messagebox.showinfo("Success", f"Finished.\nImages: {res.written_images}\nPDF: {res.pdf_path.name}")
             except Exception as e:
