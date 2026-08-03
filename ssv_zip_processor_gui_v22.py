@@ -980,7 +980,9 @@ def find_header_row(csv_path: Path, column_mapping: Optional[Mapping[str, str]] 
     with csv_path.open("r", encoding="utf-8-sig", newline="") as f:
         reader = csv.reader(f)
         for idx, row in enumerate(reader):
-            row_norm = [c.strip() for c in row]
+            if configured_row is not None and idx != configured_row:
+                continue
+            row_norm = [c.strip() for c in row[:column_count]]
             if not row_norm:
                 continue
             # check if it includes required columns
@@ -1997,6 +1999,91 @@ def process_zip_to_folder_and_pdf(zip_path: Path, out_dir: Path, project_overrid
 # GUI
 # =========================
 if tk is not None:
+    class CsvSchemaPreviewDialog(tk.Toplevel):
+        """Preview raw CSV rows and collect the table start and width."""
+
+        def __init__(self, master: tk.Misc, csv_path: Path) -> None:
+            super().__init__(master)
+            self.title("Select CSV table range")
+            self.geometry("1000x600")
+            self.transient(master)
+            self.result: Optional[Tuple[int, int, Tuple[str, ...]]] = None
+            self.rows = read_csv_preview(csv_path)
+            self.max_columns = max(len(row) for row in self.rows)
+            widest_row = next(index for index, row in enumerate(self.rows)
+                              if len(row) == self.max_columns)
+
+            instructions = ttk.Label(
+                self, padding=10, wraplength=950,
+                text="Preview the CSV below. Choose the row containing the column names and "
+                     "the number of leading columns that belong to the table. Row numbers are 1-based.")
+            instructions.pack(fill="x")
+            controls = ttk.Frame(self, padding=(10, 0, 10, 8)); controls.pack(fill="x")
+            self.row_var = tk.IntVar(value=widest_row + 1)
+            self.count_var = tk.IntVar(value=self.max_columns)
+            ttk.Label(controls, text="Table starts at row:").pack(side="left")
+            ttk.Spinbox(controls, from_=1, to=len(self.rows), textvariable=self.row_var,
+                        width=7, command=self._selection_changed).pack(side="left", padx=(5, 18))
+            ttk.Label(controls, text="Columns to read:").pack(side="left")
+            ttk.Spinbox(controls, from_=1, to=self.max_columns, textvariable=self.count_var,
+                        width=7, command=self._selection_changed).pack(side="left", padx=5)
+            self.selection_note = ttk.Label(controls); self.selection_note.pack(side="left", padx=12)
+            self.row_var.trace_add("write", lambda *_: self._selection_changed())
+            self.count_var.trace_add("write", lambda *_: self._selection_changed())
+
+            table_frame = ttk.Frame(self, padding=(10, 0)); table_frame.pack(fill="both", expand=True)
+            columns = [f"column-{index}" for index in range(1, self.max_columns + 1)]
+            self.preview = ttk.Treeview(table_frame, columns=columns, show="tree headings")
+            self.preview.heading("#0", text="Row"); self.preview.column("#0", width=55, stretch=False)
+            for index, column in enumerate(columns, start=1):
+                self.preview.heading(column, text=f"Column {index}")
+                self.preview.column(column, width=150, stretch=False)
+            yscroll = ttk.Scrollbar(table_frame, orient="vertical", command=self.preview.yview)
+            xscroll = ttk.Scrollbar(table_frame, orient="horizontal", command=self.preview.xview)
+            self.preview.configure(yscrollcommand=yscroll.set, xscrollcommand=xscroll.set)
+            self.preview.grid(row=0, column=0, sticky="nsew")
+            yscroll.grid(row=0, column=1, sticky="ns"); xscroll.grid(row=1, column=0, sticky="ew")
+            table_frame.rowconfigure(0, weight=1); table_frame.columnconfigure(0, weight=1)
+            self.preview.tag_configure("header", background="#d9edf7")
+            for index, row in enumerate(self.rows, start=1):
+                self.preview.insert("", "end", iid=str(index), text=str(index),
+                                    values=(*row, *("" for _ in range(self.max_columns - len(row)))))
+
+            footer = ttk.Frame(self, padding=10); footer.pack(fill="x")
+            ttk.Button(footer, text="Cancel", command=self.destroy).pack(side="right")
+            ttk.Button(footer, text="Use selected range", command=self._accept).pack(side="right", padx=8)
+            self._selection_changed()
+            self.grab_set(); self.wait_window()
+
+        def _selection_changed(self) -> None:
+            try:
+                row_number, count = self.row_var.get(), self.count_var.get()
+            except (tk.TclError, ValueError):
+                return
+            for item in self.preview.get_children():
+                self.preview.item(item, tags=("header",) if item == str(row_number) else ())
+            if 1 <= row_number <= len(self.rows):
+                self.preview.see(str(row_number))
+                available = len(self.rows[row_number - 1])
+                self.selection_note.config(text=f"Selected row contains {available} column(s).")
+
+        def _accept(self) -> None:
+            try:
+                header_row = self.row_var.get() - 1
+                column_count = self.count_var.get()
+                if not 0 <= header_row < len(self.rows) or not 1 <= column_count <= self.max_columns:
+                    raise ValueError("Select a valid table row and column count.")
+                headers = tuple(self.rows[header_row][:column_count])
+                if len(headers) != column_count:
+                    raise ValueError("The selected row has fewer columns than the requested count.")
+                if any(not value for value in headers) or len(headers) != len(set(headers)):
+                    raise ValueError("Selected column names must be non-empty and unique.")
+            except (tk.TclError, ValueError) as exc:
+                messagebox.showerror("Invalid table range", str(exc), parent=self); return
+            self.result = (header_row, column_count, headers)
+            self.destroy()
+
+
     class TemplateManagerDialog(tk.Toplevel):
         """Editor for export presentation templates and their uploaded CSV schema."""
         def __init__(self, master: "App") -> None:
