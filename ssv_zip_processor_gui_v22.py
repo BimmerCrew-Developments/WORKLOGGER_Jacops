@@ -2221,14 +2221,52 @@ def main() -> None:
     ap.add_argument("--zip", dest="zip_path", help="Path to input ZIP")
     ap.add_argument("--out", dest="out_dir", help="Output folder path")
     ap.add_argument("--project", dest="project", help="Override Project/Locatie Naam")
+    ap.add_argument(
+        "--export-template", metavar="TEMPLATE_ID",
+        help="Use the persisted export template with this stable ID",
+    )
+    ap.add_argument(
+        "--list-export-templates", action="store_true",
+        help="List available export-template IDs and display names, then exit",
+    )
     args = ap.parse_args()
 
+    if args.list_export_templates:
+        try:
+            templates = load_export_templates()
+        except ExportTemplateConfigurationError as exc:
+            ap.error(str(exc))
+        for template in templates:
+            print(f"{template.template_id}\t{template.display_name}")
+        return
+
     if args.zip_path and args.out_dir:
-        res = process_zip_to_folder_and_pdf(Path(args.zip_path), Path(args.out_dir), project_override=args.project, log=print)
+        template = None
+        if args.export_template is not None:
+            try:
+                templates = load_export_templates()
+            except ExportTemplateConfigurationError as exc:
+                ap.error(str(exc))
+            template = next(
+                (item for item in templates if item.template_id == args.export_template),
+                None,
+            )
+            if template is None:
+                ap.error(
+                    f"export template ID {args.export_template!r} does not exist; "
+                    "use --list-export-templates to see available IDs"
+                )
+        res = process_zip_to_folder_and_pdf(
+            Path(args.zip_path), Path(args.out_dir), project_override=args.project,
+            log=print, template=template,
+        )
         print("Files produced:")
         for artifact in res.generated_artifacts:
             print(artifact)
         return
+
+    if args.export_template is not None:
+        ap.error("--export-template requires both --zip and --out")
 
     # default to GUI
     if tk is None:
