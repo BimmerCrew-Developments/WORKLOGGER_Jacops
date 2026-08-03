@@ -104,6 +104,43 @@ def test_required_report_text_is_validated_on_load_and_save(tmp_path):
         app.load_export_templates(destination)
 
 
+def test_template_serialization_round_trips_all_output_and_layout_settings():
+    original = replace(
+        _custom(), enabled_sections=("photos", "address"),
+        section_order=("photos", "address"), include_photo_pages=False,
+        include_loose_images=False, include_pdf_attachments=False,
+        create_output_zip=False, empty_value_fallback="--",
+        photo_grid={**app.WERKLOGGER_EXPORT_TEMPLATE.photo_grid, "rows": 2, "columns": 1},
+    )
+
+    restored = app.export_template_from_dict(app.export_template_to_dict(original))
+
+    assert restored == original
+
+
+@pytest.mark.parametrize(
+    "pattern",
+    ["{building_id.__class__}.pdf", "{project_name[0]}.pdf", "{building_id!r}.pdf",
+     "{report_datetime:20}.pdf", "{unknown}.pdf", "{}.pdf"],
+)
+def test_placeholder_substitution_rejects_expression_and_formatting_syntax(pattern):
+    with pytest.raises(ValueError):
+        app.substitute_export_placeholders(
+            pattern, {key: "safe" for key in app.FILENAME_PLACEHOLDERS},
+            app.FILENAME_PLACEHOLDERS,
+        )
+
+
+def test_placeholder_substitution_only_inserts_allowlisted_literal_values():
+    rendered = app.substitute_export_placeholders(
+        "{{report}}-{building_id}-{project_name}",
+        {"building_id": "B-1", "project_name": "Project", "report_datetime": "ignored"},
+        app.FILENAME_PLACEHOLDERS,
+    )
+
+    assert rendered == "{report}-B-1-Project"
+
+
 def test_valid_backup_recovers_and_preserves_damaged_document(tmp_path):
     destination = tmp_path / "templates.json"
     first = _custom("first", "First")

@@ -62,3 +62,13 @@ The listing shows both the stable ID accepted by `--export-template` and the
 editable display name. Always use the ID in scripts.
 
 You can still use `run_worklogger.command` on macOS if you already have Python installed; it will install dependencies and launch the GUI.
+
+## Run the test suite
+
+The tests create isolated temporary directories and generate their own CSV, JPEG,
+ZIP, and PDF fixtures, so no sample customer exports are required:
+
+```sh
+python3 -m pip install -r requirements-test.txt
+python3 -m pytest
+```
