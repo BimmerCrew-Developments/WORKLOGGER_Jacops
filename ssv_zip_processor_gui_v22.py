@@ -201,9 +201,8 @@ WERKLOGGER_EXPORT_TEMPLATE = ExportTemplate(
     },
     photo_grid={
         "columns": 2, "rows": 3, "left": 56.6929, "right": 538.5827,
-        "column_gap": 28.3464, "box_height": 170.0787, "row_top": 745.5118,
-        "row_step": 198.4252, "label_offset": 12.1102,
-        "heading_y": 782.30, "underline_y": 773.8585,
+        "column_gap": 28.3464, "top_margin": 56.6929,
+        "heading_area": 39.685, "label_allowance": 18.0, "row_gap": 10.0,
     },
     output_filename_pattern="{building_id}-{project_name}-{report_datetime}-RAPPORT.pdf",
     include_photo_pages=True,
@@ -241,6 +240,73 @@ class ExportTemplateConfigurationError(RuntimeError):
     def __init__(self, message: str, recovered_templates: Optional[List[ExportTemplate]] = None) -> None:
         super().__init__(message)
         self.recovered_templates = recovered_templates
+
+
+# Photo cells smaller than one inch are not useful in a printed work report.
+# The explicit count limits also keep accidental values from producing enormous
+# documents, even on an unusually large custom page size.
+MIN_PHOTO_WIDTH = 72.0
+MIN_PHOTO_HEIGHT = 72.0
+MAX_PHOTO_COLUMNS = 5
+MAX_PHOTO_ROWS = 6
+
+
+@dataclass(frozen=True)
+class PhotoGridGeometry:
+    """Fully resolved photo geometry, in PDF points."""
+
+    column_boxes: Tuple[Tuple[float, float], ...]
+    row_tops: Tuple[float, ...]
+    box_width: float
+    box_height: float
+    row_step: float
+    heading_y: float
+    underline_y: float
+
+
+def calculate_photo_grid_geometry(page_settings: Mapping[str, Any],
+                                  photo_grid: Mapping[str, Any]) -> PhotoGridGeometry:
+    """Derive photo cells from the printable region instead of fixed A4 rows."""
+    page_width, page_height = (float(value) for value in page_settings["pagesize"])
+    left = float(photo_grid["left"])
+    right = float(photo_grid["right"])
+    bottom = float(page_settings["bottom_y"])
+    top_margin = float(photo_grid.get("top_margin", left))
+    heading_area = float(photo_grid.get("heading_area", 39.685))
+    label_allowance = float(photo_grid.get("label_allowance", 18.0))
+    row_gap = float(photo_grid.get("row_gap", 10.0))
+    column_gap = float(photo_grid["column_gap"])
+    rows, columns = int(photo_grid["rows"]), int(photo_grid["columns"])
+
+    if not 1 <= rows <= MAX_PHOTO_ROWS or not 1 <= columns <= MAX_PHOTO_COLUMNS:
+        raise ValueError(
+            f"Photo grid supports 1-{MAX_PHOTO_ROWS} rows and "
+            f"1-{MAX_PHOTO_COLUMNS} columns."
+        )
+    printable_top = page_height - top_margin
+    images_top = printable_top - heading_area - label_allowance
+    available_image_height = images_top - bottom - row_gap * (rows - 1) - label_allowance * (rows - 1)
+    box_height = available_image_height / rows
+    box_width = (right - left - column_gap * (columns - 1)) / columns
+    if left < 0 or right > page_width or right <= left or bottom < 0 or printable_top > page_height:
+        raise ValueError("Photo margins must define a printable region inside the selected page size.")
+    if heading_area < 0 or label_allowance < 0 or row_gap < 0 or column_gap < 0:
+        raise ValueError("Photo heading, label, and gap allowances cannot be negative.")
+    if box_width < MIN_PHOTO_WIDTH or box_height < MIN_PHOTO_HEIGHT:
+        raise ValueError(
+            "Photo grid does not fit the printable page: each image must be at least "
+            f"{MIN_PHOTO_WIDTH / 72:g} x {MIN_PHOTO_HEIGHT / 72:g} inch including label space."
+        )
+    row_step = box_height + label_allowance + row_gap
+    row_tops = tuple(images_top - index * row_step for index in range(rows))
+    column_boxes = tuple(
+        (left + index * (box_width + column_gap), left + index * (box_width + column_gap) + box_width)
+        for index in range(columns)
+    )
+    return PhotoGridGeometry(
+        column_boxes, row_tops, box_width, box_height, row_step,
+        printable_top - 14.0, printable_top - heading_area + 8.0,
+    )
 
 
 def _adjacent_export_template_path() -> Path:
@@ -281,7 +347,8 @@ def export_template_from_dict(data: Mapping[str, Any]) -> ExportTemplate:
         enabled_sections=tuple(data["enabled_sections"]), section_order=tuple(data["section_order"]),
         section_fields={str(k): tuple(v) for k, v in dict(data.get("section_fields", SECTION_FIELD_KEYS)).items()},
         field_labels={str(k): str(v) for k, v in dict(data["field_labels"]).items()},
-        photo_grid=dict(data["photo_grid"]), output_filename_pattern=str(data["output_filename_pattern"]),
+        photo_grid={**WERKLOGGER_EXPORT_TEMPLATE.photo_grid, **dict(data["photo_grid"])},
+        output_filename_pattern=str(data["output_filename_pattern"]),
         include_photo_pages=bool(data.get("include_photo_pages", True)),
         include_loose_images=bool(data.get("include_loose_images", True)),
         include_pdf_attachments=bool(data.get("include_pdf_attachments", True)),
@@ -295,7 +362,9 @@ def export_template_from_dict(data: Mapping[str, Any]) -> ExportTemplate:
 
 
 def validate_template_values(name: str, title: str, pattern: str, colors: Mapping[str, Any],
-                             sections: List[str], rows: Any, columns: Any) -> List[str]:
+                             sections: List[str], rows: Any, columns: Any,
+                             page_settings: Optional[Mapping[str, Any]] = None,
+                             photo_grid: Optional[Mapping[str, Any]] = None) -> List[str]:
     """Return all user-facing validation errors for editable template values."""
     errors: List[str] = []
     if not name.strip(): errors.append("Template name is required.")
@@ -307,8 +376,14 @@ def validate_template_values(name: str, title: str, pattern: str, colors: Mappin
         errors.append(f"Invalid filename pattern: {exc}")
     if not sections: errors.append("Enable at least one section.")
     try:
-        if int(rows) < 1 or int(columns) < 1: raise ValueError
-    except (TypeError, ValueError): errors.append("Photo rows and columns must be positive whole numbers.")
+        parsed_rows, parsed_columns = int(rows), int(columns)
+        if str(rows).strip() != str(parsed_rows) or str(columns).strip() != str(parsed_columns): raise ValueError
+        candidate_grid = dict(photo_grid or WERKLOGGER_EXPORT_TEMPLATE.photo_grid)
+        candidate_grid.update(rows=parsed_rows, columns=parsed_columns)
+        calculate_photo_grid_geometry(page_settings or WERKLOGGER_EXPORT_TEMPLATE.page_settings, candidate_grid)
+    except (TypeError, ValueError) as exc:
+        errors.append(str(exc) if str(exc).startswith("Photo grid") else
+                      "Photo rows and columns must be positive whole numbers within the printable page.")
     for key, value in colors.items():
         if not re.fullmatch(r"#[0-9a-fA-F]{6}", str(value).strip()):
             errors.append(f"Color {key} must use #RRGGBB format.")
@@ -461,8 +536,7 @@ def resolve_export_template(template: Optional[ExportTemplate]) -> ExportTemplat
             and set(template.field_labels).issubset(EXPORT_FIELD_REGISTRY)
             and required_colors.issubset(template.colors)
             and required_grid.issubset(template.photo_grid)
-            and int(template.photo_grid["columns"]) > 0
-            and int(template.photo_grid["rows"]) > 0
+            and bool(calculate_photo_grid_geometry(template.page_settings, template.photo_grid))
         )
         if valid:
             substitute_export_placeholders(
@@ -1498,20 +1572,18 @@ def render_page1(c: Canvas, report: ReportRow, template: Optional[ExportTemplate
 
 
 def render_photos_pages(c: Canvas, report: ReportRow, template: Optional[ExportTemplate] = None) -> None:
-    """Render photo pages matching the reference layout (2 columns, 3 rows per page)."""
+    """Render photo pages using geometry derived from the template and page."""
     template = resolve_export_template(template)
     w, h = template.page_settings["pagesize"]
     grid, layout = template.photo_grid, template.layout
     X_LEFT, X_RIGHT = grid["left"], grid["right"]
     RED, LINE_W = template.colors["primary"], layout["line_width"]
-    heading_y, underline_y = grid["heading_y"], grid["underline_y"]
+    geometry = calculate_photo_grid_geometry(template.page_settings, grid)
+    heading_y, underline_y = geometry.heading_y, geometry.underline_y
     columns = int(grid["columns"])
-    gap = grid["column_gap"]
-    box_w = (X_RIGHT - X_LEFT - gap * (columns - 1)) / columns
-    column_boxes = [(X_LEFT + i * (box_w + gap), X_LEFT + i * (box_w + gap) + box_w) for i in range(columns)]
-    box_h = grid["box_height"]
-    row_top_start, row_step = grid["row_top"], grid["row_step"]
-    label_offset = grid["label_offset"]
+    box_w, column_boxes = geometry.box_width, geometry.column_boxes
+    box_h = geometry.box_height
+    label_allowance = float(grid.get("label_allowance", 18.0))
     rows_per_page = int(grid["rows"])
 
     def draw_page_heading(first: bool) -> None:
@@ -1541,7 +1613,7 @@ def render_photos_pages(c: Canvas, report: ReportRow, template: Optional[ExportT
     draw_page_heading(first_page)
     first_page = False
 
-    row_index = 0  # 0..2 (3 rows)
+    row_index = 0
 
     def ensure_row_available() -> None:
         nonlocal row_index, first_page
@@ -1561,9 +1633,9 @@ def render_photos_pages(c: Canvas, report: ReportRow, template: Optional[ExportT
         while remaining:
             ensure_row_available()
 
-            row_top = row_top_start - (row_index * row_step)
+            row_top = geometry.row_tops[row_index]
             row_bottom = row_top - box_h
-            label_y = row_top + label_offset
+            label_y = row_top + label_allowance * 0.35
 
             # Print label once at the first row for the group on this page.
             if not label_printed_on_this_page:
@@ -1988,7 +2060,8 @@ if tk is not None:
             enabled = [key for key in order if self.section_vars[key].get()]
             errors = validate_template_values(self.name_var.get(), self.title_var.get(), self.pattern_var.get(),
                                               {k: v.get() for k, v in self.color_vars.items()}, enabled,
-                                              self.rows_var.get(), self.columns_var.get())
+                                              self.rows_var.get(), self.columns_var.get(),
+                                              current.page_settings, current.photo_grid)
             if any(not variable.get().strip() for variable in self.label_vars.values()):
                 errors.append("All display labels are required.")
             if any(t.display_name.casefold() == self.name_var.get().strip().casefold() and i != index
