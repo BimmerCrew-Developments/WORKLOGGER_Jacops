@@ -129,6 +129,43 @@ def test_template_json_storage_preserves_pagesize_tuple(tmp_path):
     assert isinstance(restored.page_settings["pagesize"], tuple)
 
 
+def test_uploaded_csv_schema_and_column_mappings_round_trip():
+    original = replace(
+        _custom(), csv_headers=("Record", "Kind", "Caption", "Answer", "Files"),
+        csv_column_mapping={"ID": "Record", "Type": "Kind", "Label": "Caption",
+                            "Primary": "Answer", "Media": "Files"},
+        pdf_field_columns={"building_id": "Record", "project_name": "Answer"},
+    )
+
+    restored = app.export_template_from_dict(app.export_template_to_dict(original))
+
+    assert restored.csv_headers == original.csv_headers
+    assert restored.csv_column_mapping == original.csv_column_mapping
+    assert restored.pdf_field_columns == original.pdf_field_columns
+
+
+def test_custom_csv_column_names_are_used_for_import_and_direct_values(tmp_path):
+    source = tmp_path / "custom.csv"
+    source.write_text(
+        "Record,Kind,Caption,Answer,Extra,Comment,Files\n"
+        "1,text,Building,BLD-42,,,\n"
+        "2,media,Overview,,,,photo-1\n",
+        encoding="utf-8",
+    )
+    mapping = {"ID": "Record", "Type": "Kind", "Label": "Caption",
+               "Primary": "Answer", "Secondary": "Extra", "Note": "Comment",
+               "Media": "Files"}
+
+    meta, fields, media, rows = app.load_audit_csv(source, mapping)
+    header_idx = app.find_header_row(source, mapping)
+
+    assert meta == {}
+    assert fields["Building"] == "BLD-42"
+    assert media[0].media_ids == ["photo-1"]
+    assert rows[0].row_id == "1"
+    assert app.read_first_csv_values(source, header_idx)["Answer"] == "BLD-42"
+
+
 @pytest.mark.parametrize(
     "pattern",
     ["{building_id.__class__}.pdf", "{project_name[0]}.pdf", "{building_id!r}.pdf",

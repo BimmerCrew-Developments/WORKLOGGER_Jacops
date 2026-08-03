@@ -176,6 +176,12 @@ class ExportTemplate:
     create_output_zip: bool = True
     empty_value_fallback: str = "Niet ingevuld"
     layout: Mapping[str, Any] = field(default_factory=dict)
+    # The uploaded CSV is used as a schema sample only; no customer rows are
+    # persisted.  These mappings let otherwise identical exports rename their
+    # structural columns and feed PDF fields directly from a chosen column.
+    csv_headers: Tuple[str, ...] = ()
+    csv_column_mapping: Mapping[str, str] = field(default_factory=dict)
+    pdf_field_columns: Mapping[str, str] = field(default_factory=dict)
 
 
 # All report copy which is not sourced from the CSV lives here.  Keeping these
@@ -254,9 +260,14 @@ SECTION_BRANDING_KEYS = {
     "post_registrations": "section_post_registrations",
 }
 FILENAME_PLACEHOLDERS = frozenset({"building_id", "project_name", "report_datetime"})
+CSV_COLUMN_ROLES = ("ID", "Parent ID", "Type", "Label", "Primary", "Secondary", "Note", "Media")
+PDF_COLUMN_FIELDS = (
+    "report_datetime", "subcontractor", "project_name", "building_id", "address",
+    "postal_city", "contact", "quadrant", "duct_color", "units_welded",
+)
 
 
-EXPORT_TEMPLATE_CONFIG_VERSION = 1
+EXPORT_TEMPLATE_CONFIG_VERSION = 2
 
 
 class ExportTemplateConfigurationError(RuntimeError):
@@ -360,6 +371,9 @@ def export_template_to_dict(template: ExportTemplate) -> Dict[str, Any]:
         "include_pdf_attachments": template.include_pdf_attachments,
         "create_output_zip": template.create_output_zip,
         "empty_value_fallback": template.empty_value_fallback, "layout": dict(template.layout),
+        "csv_headers": list(template.csv_headers),
+        "csv_column_mapping": dict(template.csv_column_mapping),
+        "pdf_field_columns": dict(template.pdf_field_columns),
     }
 
 
@@ -390,6 +404,9 @@ def export_template_from_dict(data: Mapping[str, Any]) -> ExportTemplate:
         create_output_zip=bool(data.get("create_output_zip", True)),
         empty_value_fallback=str(data.get("empty_value_fallback", "Niet ingevuld")),
         layout=dict(data["layout"]),
+        csv_headers=tuple(str(value) for value in data.get("csv_headers", ())),
+        csv_column_mapping={str(k): str(v) for k, v in dict(data.get("csv_column_mapping", {})).items()},
+        pdf_field_columns={str(k): str(v) for k, v in dict(data.get("pdf_field_columns", {})).items()},
     )
     if resolve_export_template(template) is not template:
         raise ValueError("Invalid export template")
@@ -468,7 +485,7 @@ def _decode_export_template_config(path: Path, *, legacy: bool = False) -> List[
             items = data
         else:
             version = data.get("version") if isinstance(data, dict) else None
-            if type(version) is not int or version != EXPORT_TEMPLATE_CONFIG_VERSION:
+            if type(version) is not int or version not in (1, EXPORT_TEMPLATE_CONFIG_VERSION):
                 raise ExportTemplateConfigurationError(
                     f"Unsupported export-template configuration version {version!r} in {path}; "
                     f"expected {EXPORT_TEMPLATE_CONFIG_VERSION}."
@@ -571,6 +588,10 @@ def resolve_export_template(template: Optional[ExportTemplate]) -> ExportTemplat
             and set(template.field_labels).issubset(EXPORT_FIELD_REGISTRY)
             and required_colors.issubset(template.colors)
             and required_grid.issubset(template.photo_grid)
+            and set(template.csv_column_mapping).issubset(CSV_COLUMN_ROLES)
+            and set(template.pdf_field_columns).issubset(PDF_COLUMN_FIELDS)
+            and all(value in template.csv_headers for value in template.csv_column_mapping.values())
+            and all(value in template.csv_headers for value in template.pdf_field_columns.values())
             and REQUIRED_BRANDING_KEYS.issubset(template.branding)
             and all(isinstance(template.branding[key], str) and template.branding[key].strip()
                     for key in REQUIRED_BRANDING_KEYS)
@@ -954,7 +975,7 @@ def project_default_template(project: ProjectRecord, templates: List[ExportTempl
 REQUIRED_COLUMNS = ["ID", "Type", "Label", "Primary", "Secondary", "Note", "Media"]
 
 
-def find_header_row(csv_path: Path) -> int:
+def find_header_row(csv_path: Path, column_mapping: Optional[Mapping[str, str]] = None) -> int:
     """Find the header row index (0-based) that contains required columns."""
     with csv_path.open("r", encoding="utf-8-sig", newline="") as f:
         reader = csv.reader(f)
@@ -964,14 +985,47 @@ def find_header_row(csv_path: Path) -> int:
                 continue
             # check if it includes required columns
             cols = {c for c in row_norm}
-            if all(c in cols for c in REQUIRED_COLUMNS):
+            required = [column_mapping.get(key, key) if column_mapping else key for key in REQUIRED_COLUMNS]
+            if all(c in cols for c in required):
                 return idx
     raise ValueError("Could not find CSV header row with required columns.")
 
 
-def load_audit_csv(csv_path: Path) -> Tuple[Dict[str, str], Dict[str, str], List[MediaRow], List[AuditRow]]:
+def inspect_csv_headers(csv_path: Path) -> Tuple[str, ...]:
+    """Read the first widest row, allowing metadata lines before the header."""
+    candidate: Tuple[str, ...] = ()
+    with csv_path.open("r", encoding="utf-8-sig", newline="") as handle:
+        for row in csv.reader(handle):
+            values = tuple(cell.strip() for cell in row)
+            if len(values) > len(candidate):
+                candidate = values
+    headers = tuple(value for value in candidate if value)
+    if not headers:
+        raise ValueError("The selected CSV does not contain a header row.")
+    if len(headers) != len(candidate) or len(headers) != len(set(headers)):
+        raise ValueError("CSV template column names must be non-empty and unique.")
+    return headers
+
+
+def read_first_csv_values(csv_path: Path, header_idx: int) -> Dict[str, str]:
+    """Return the first non-empty value per source column for direct PDF mappings."""
+    values: Dict[str, str] = {}
+    with csv_path.open("r", encoding="utf-8-sig", newline="") as handle:
+        for _ in range(header_idx):
+            next(handle)
+        for row in csv.DictReader(handle):
+            for key, value in row.items():
+                cleaned = (value or "").strip()
+                if key and cleaned:
+                    values.setdefault(key.strip(), cleaned)
+    return values
+
+
+def load_audit_csv(csv_path: Path, column_mapping: Optional[Mapping[str, str]] = None) -> Tuple[Dict[str, str], Dict[str, str], List[MediaRow], List[AuditRow]]:
     """Load SafetyAuditor export CSV and return meta, field-values, media rows, audit rows."""
-    header_idx = find_header_row(csv_path)
+    mapping = dict(column_mapping or {})
+    header_idx = find_header_row(csv_path, mapping)
+    source = lambda raw, key: raw.get(mapping.get(key, key))  # noqa: E731
 
     audit_rows: List[AuditRow] = []
     with csv_path.open("r", encoding="utf-8-sig", newline="") as f:
@@ -981,16 +1035,16 @@ def load_audit_csv(csv_path: Path) -> Tuple[Dict[str, str], Dict[str, str], List
 
         reader = csv.DictReader(f)
         for raw in reader:
-            rid = (raw.get("ID") or "").strip()
+            rid = (source(raw, "ID") or "").strip()
             row = AuditRow(
                 row_id=rid,
-                parent_id=(raw.get("Parent ID") or raw.get("ParentID") or raw.get("Parent") or "").strip(),
-                row_type=(raw.get("Type") or "").strip(),
-                label=(raw.get("Label") or "").strip(),
-                primary=(raw.get("Primary") or "").strip(),
-                secondary=(raw.get("Secondary") or "").strip(),
-                note=(raw.get("Note") or "").strip(),
-                media=(raw.get("Media") or "").strip(),
+                parent_id=(source(raw, "Parent ID") or raw.get("ParentID") or raw.get("Parent") or "").strip(),
+                row_type=(source(raw, "Type") or "").strip(),
+                label=(source(raw, "Label") or "").strip(),
+                primary=(source(raw, "Primary") or "").strip(),
+                secondary=(source(raw, "Secondary") or "").strip(),
+                note=(source(raw, "Note") or "").strip(),
+                media=(source(raw, "Media") or "").strip(),
             )
             audit_rows.append(row)
 
@@ -1780,7 +1834,10 @@ def process_zip_to_folder_and_pdf(zip_path: Path, out_dir: Path, project_overrid
         csv_path = csv_files[0]
         _log(f"Found CSV: {csv_path.name}")
 
-        meta, fields, media_rows, audit_rows = load_audit_csv(csv_path)
+        template = resolve_export_template(template)
+        header_idx = find_header_row(csv_path, template.csv_column_mapping)
+        meta, fields, media_rows, audit_rows = load_audit_csv(csv_path, template.csv_column_mapping)
+        direct_values = read_first_csv_values(csv_path, header_idx)
 
         # Extract materials/work tables (preferred)
         mat_articles, work_articles = extract_articles_from_csv(audit_rows)
@@ -1812,6 +1869,17 @@ def process_zip_to_folder_and_pdf(zip_path: Path, out_dir: Path, project_overrid
             post_afmeldingen_lines=post_afmeldingen,
             photos=[],
         )
+        report_attributes = {
+            "report_datetime": "report_datetime", "subcontractor": "naam_onderaannemer",
+            "project_name": "project_locatie_naam", "building_id": "building_id",
+            "address": "adres", "postal_city": "postcode_stad", "contact": "contactpersoon",
+            "quadrant": "quadrant", "duct_color": "duct_kleur", "units_welded": "units_gelast",
+        }
+        for field_key, column_name in template.pdf_field_columns.items():
+            value = direct_values.get(column_name, "")
+            if value:
+                if field_key == "address": value = sanitize_address(value)
+                setattr(report, report_attributes[field_key], value)
 
         # Build an index for images (case-insensitive)
         all_files = list(tmp.rglob("*"))
@@ -1820,8 +1888,6 @@ def process_zip_to_folder_and_pdf(zip_path: Path, out_dir: Path, project_overrid
             if p.is_file() and p.suffix.lower() in {".jpeg", ".jpg"}:
                 img_by_stem[p.stem.lower()] = p
         nonimg_stems: Set[str] = {p.stem.lower() for p in all_files if p.is_file() and p.suffix.lower() not in {'.jpeg','.jpg'}}
-
-        template = resolve_export_template(template)
 
         # Plan every output before writing anything, so collisions never cause a
         # partially overwritten export. Image discovery itself is unchanged.
@@ -1932,7 +1998,7 @@ def process_zip_to_folder_and_pdf(zip_path: Path, out_dir: Path, project_overrid
 # =========================
 if tk is not None:
     class TemplateManagerDialog(tk.Toplevel):
-        """Editor for export presentation templates (CSV import keys stay immutable)."""
+        """Editor for export presentation templates and their uploaded CSV schema."""
         def __init__(self, master: "App") -> None:
             super().__init__(master)
             self.app = master
@@ -1956,8 +2022,10 @@ if tk is not None:
             book = ttk.Notebook(right); book.pack(fill="both", expand=True, pady=5)
             general = ttk.Frame(book, padding=8); sections = ttk.Frame(book, padding=8)
             labels = ttk.Frame(book, padding=8); text_tab = ttk.Frame(book, padding=8)
+            csv_tab = ttk.Frame(book, padding=8)
             book.add(general, text="Report & photos"); book.add(sections, text="Sections")
             book.add(labels, text="CSV-backed fields / labels")
+            book.add(csv_tab, text="CSV column mapping")
             book.add(text_tab, text="Report text")
 
             self.name_var = tk.StringVar(); self.title_var = tk.StringVar(); self.pattern_var = tk.StringVar()
@@ -2012,6 +2080,28 @@ if tk is not None:
             for row, (key, variable) in enumerate(self.label_vars.items()):
                 ttk.Label(label_frame, text=key, width=22).grid(row=row, column=0, sticky="w", pady=2)
                 ttk.Entry(label_frame, textvariable=variable, width=42).grid(row=row, column=1, sticky="ew", pady=2)
+
+            ttk.Label(csv_tab, text="Upload a CSV when creating a template, then map its column names below.",
+                      wraplength=560).grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 8))
+            self.csv_schema_note = ttk.Label(csv_tab)
+            self.csv_schema_note.grid(row=1, column=0, columnspan=3, sticky="w", pady=(0, 8))
+            ttk.Label(csv_tab, text="CSV purpose").grid(row=2, column=0, sticky="w")
+            ttk.Label(csv_tab, text="Uploaded column").grid(row=2, column=1, sticky="w")
+            self.csv_role_vars = {key: tk.StringVar() for key in CSV_COLUMN_ROLES}
+            self.csv_role_boxes = {}
+            for row, (key, variable) in enumerate(self.csv_role_vars.items(), start=3):
+                ttk.Label(csv_tab, text=key).grid(row=row, column=0, sticky="w", pady=2)
+                box = ttk.Combobox(csv_tab, textvariable=variable, state="readonly", width=34)
+                box.grid(row=row, column=1, sticky="ew", pady=2); self.csv_role_boxes[key] = box
+            ttk.Label(csv_tab, text="PDF field (optional direct value)").grid(row=2, column=2, sticky="w", padx=(24, 0))
+            ttk.Label(csv_tab, text="Uploaded column").grid(row=2, column=3, sticky="w")
+            self.pdf_column_vars = {key: tk.StringVar() for key in PDF_COLUMN_FIELDS}
+            self.pdf_column_boxes = {}
+            for row, (key, variable) in enumerate(self.pdf_column_vars.items(), start=3):
+                ttk.Label(csv_tab, text=EXPORT_FIELD_REGISTRY[key].display_name).grid(row=row, column=2, sticky="w", padx=(24, 6), pady=2)
+                box = ttk.Combobox(csv_tab, textvariable=variable, state="readonly", width=34)
+                box.grid(row=row, column=3, sticky="ew", pady=2); self.pdf_column_boxes[key] = box
+            csv_tab.columnconfigure(3, weight=1)
 
             text_canvas = tk.Canvas(text_tab, highlightthickness=0)
             text_scroll = ttk.Scrollbar(text_tab, command=text_canvas.yview)
@@ -2068,9 +2158,34 @@ if tk is not None:
             for section in template.section_order: self.order_list.insert("end", section)
             for key, variable in self.label_vars.items(): variable.set(template.field_labels[key])
             for key, variable in self.branding_vars.items(): variable.set(template.branding[key])
+            choices = ("", *template.csv_headers)
+            self.csv_schema_note.config(text=(f"{len(template.csv_headers)} columns loaded: " + ", ".join(template.csv_headers))
+                                        if template.csv_headers else "No uploaded CSV schema; standard column names are used.")
+            for key, variable in self.csv_role_vars.items():
+                self.csv_role_boxes[key]["values"] = choices
+                variable.set(template.csv_column_mapping.get(key, ""))
+            for key, variable in self.pdf_column_vars.items():
+                self.pdf_column_boxes[key]["values"] = choices
+                variable.set(template.pdf_field_columns.get(key, ""))
 
         def _new(self) -> None:
-            self._append_copy(WERKLOGGER_EXPORT_TEMPLATE, "New template")
+            path = filedialog.askopenfilename(
+                title="Select the CSV export for this template", filetypes=[("CSV files", "*.csv")], parent=self)
+            if not path:
+                return
+            try:
+                headers = inspect_csv_headers(Path(path))
+            except (OSError, UnicodeError, ValueError) as exc:
+                messagebox.showerror("Invalid CSV template", str(exc), parent=self); return
+            data = export_template_to_dict(WERKLOGGER_EXPORT_TEMPLATE)
+            data.update(template_id="custom-" + uuid.uuid4().hex, display_name="New template",
+                        csv_headers=list(headers))
+            folded = {header.casefold(): header for header in headers}
+            data["csv_column_mapping"] = {
+                role: folded[role.casefold()] for role in CSV_COLUMN_ROLES if role.casefold() in folded
+            }
+            self.templates.append(export_template_from_dict(data))
+            self._refresh_list(len(self.templates) - 1)
 
         def _duplicate(self) -> None:
             index = self._index()
@@ -2129,6 +2244,12 @@ if tk is not None:
             if any(t.display_name.casefold() == self.name_var.get().strip().casefold() and i != index
                    for i, t in enumerate(self.templates)):
                 errors.append("Template names must be unique.")
+            if current.csv_headers:
+                available = set(current.csv_headers)
+                missing_roles = [role for role in REQUIRED_COLUMNS
+                                 if self.csv_role_vars[role].get() not in available and role not in available]
+                if missing_roles:
+                    errors.append("Map the required CSV purposes: " + ", ".join(missing_roles) + ".")
             if errors:
                 messagebox.showerror("Cannot save template", "\n".join(errors), parent=self); return
             data = export_template_to_dict(current)
@@ -2141,6 +2262,10 @@ if tk is not None:
             data["colors"] = {key: [int(value.get().strip()[i:i+2], 16) / 255 for i in (1, 3, 5)] for key, value in self.color_vars.items()}
             data["photo_grid"].update(rows=int(self.rows_var.get()), columns=int(self.columns_var.get()))
             data["field_labels"] = {key: variable.get().strip() for key, variable in self.label_vars.items()}
+            data["csv_column_mapping"] = {key: variable.get() for key, variable in self.csv_role_vars.items()
+                                          if variable.get()}
+            data["pdf_field_columns"] = {key: variable.get() for key, variable in self.pdf_column_vars.items()
+                                         if variable.get()}
             self.templates[index] = export_template_from_dict(data)
             try: save_export_templates(self.templates)
             except ExportTemplateConfigurationError as exc:
