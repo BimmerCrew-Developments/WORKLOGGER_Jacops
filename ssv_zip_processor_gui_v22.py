@@ -232,10 +232,26 @@ SECTION_TITLES = {
 FILENAME_PLACEHOLDERS = frozenset({"building_id", "project_name", "report_datetime"})
 
 
-def _template_store_path() -> Path:
-    """Return the writable per-installation template store."""
+EXPORT_TEMPLATE_CONFIG_VERSION = 1
+
+
+class ExportTemplateConfigurationError(RuntimeError):
+    """An export-template configuration could not be safely read or written."""
+
+    def __init__(self, message: str, recovered_templates: Optional[List[ExportTemplate]] = None) -> None:
+        super().__init__(message)
+        self.recovered_templates = recovered_templates
+
+
+def _adjacent_export_template_path() -> Path:
+    """Return the location used by releases that stored data beside the app."""
     base = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
     return base / "export_templates.json"
+
+
+def export_template_config_path() -> Path:
+    """Use the same platform-aware per-user configuration root as projects."""
+    return project_config_path().with_name("export_templates.json")
 
 
 def export_template_to_dict(template: ExportTemplate) -> Dict[str, Any]:
@@ -333,39 +349,90 @@ def export_field_value(report: ReportRow, key: str, empty_fallback: str = "") ->
     return value
 
 
-def load_export_templates(path: Optional[Path] = None) -> List[ExportTemplate]:
-    """Load valid custom templates; the compatibility template is always first."""
+def _decode_export_template_config(path: Path, *, legacy: bool = False) -> List[ExportTemplate]:
+    """Decode and validate either a current document or the historical bare list."""
     result = [WERKLOGGER_EXPORT_TEMPLATE]
     try:
-        data = json.loads((path or _template_store_path()).read_text(encoding="utf-8"))
-        for item in data if isinstance(data, list) else []:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if legacy:
+            items = data
+        else:
+            version = data.get("version") if isinstance(data, dict) else None
+            if type(version) is not int or version != EXPORT_TEMPLATE_CONFIG_VERSION:
+                raise ExportTemplateConfigurationError(
+                    f"Unsupported export-template configuration version {version!r} in {path}; "
+                    f"expected {EXPORT_TEMPLATE_CONFIG_VERSION}."
+                )
+            items = data.get("templates")
+        if not isinstance(items, list):
+            raise ExportTemplateConfigurationError(f"Invalid export-template list in {path}.")
+        for item in items:
             template = export_template_from_dict(item)
             if template.template_id != WERKLOGGER_EXPORT_TEMPLATE.template_id:
                 result.append(template)
-    except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError):
-        pass
+    except ExportTemplateConfigurationError:
+        raise
+    except (OSError, UnicodeError, ValueError, TypeError, KeyError, json.JSONDecodeError) as exc:
+        raise ExportTemplateConfigurationError(
+            f"Could not read export-template configuration {path}: {exc}"
+        ) from exc
     return result
 
 
+def load_export_templates(path: Optional[Path] = None) -> List[ExportTemplate]:
+    """Load templates, migrating old storage and recovering a damaged file once."""
+    destination = path or export_template_config_path()
+    if not destination.exists():
+        legacy = _adjacent_export_template_path()
+        if path is None and legacy.exists() and legacy != destination:
+            templates = _decode_export_template_config(legacy, legacy=True)
+            save_export_templates(templates, destination)
+            return templates
+        return [WERKLOGGER_EXPORT_TEMPLATE]
+    try:
+        return _decode_export_template_config(destination)
+    except ExportTemplateConfigurationError as original_error:
+        backup = destination.with_suffix(destination.suffix + ".bak")
+        if not backup.exists():
+            raise
+        try:
+            recovered = _decode_export_template_config(backup)
+            damaged = destination.with_name(f"{destination.name}.damaged-{uuid.uuid4().hex}")
+            os.replace(destination, damaged)
+            _atomic_write(destination, backup.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, ExportTemplateConfigurationError) as recovery_error:
+            raise ExportTemplateConfigurationError(
+                f"{original_error} Backup recovery also failed: {recovery_error}"
+            ) from original_error
+        raise ExportTemplateConfigurationError(
+            f"The damaged export-template configuration was preserved as {damaged}. "
+            f"Templates were recovered from {backup}.",
+            recovered_templates=recovered,
+        ) from original_error
+
+
 def save_export_templates(templates: List[ExportTemplate], path: Optional[Path] = None) -> None:
-    """Atomically persist custom templates, never writing the built-in template."""
-    destination = path or _template_store_path()
+    """Atomically persist templates and back up the last valid document."""
+    destination = path or export_template_config_path()
     invalid = [template.template_id for template in templates if resolve_export_template(template) is not template]
     if invalid:
-        raise ValueError("Refusing to save invalid template(s): " + ", ".join(invalid))
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    payload = [export_template_to_dict(t) for t in templates
-               if t.template_id != WERKLOGGER_EXPORT_TEMPLATE.template_id]
-    fd, temp_name = tempfile.mkstemp(prefix=destination.name + ".", suffix=".tmp", dir=str(destination.parent))
+        raise ExportTemplateConfigurationError("Refusing to save invalid template(s): " + ", ".join(invalid))
+    document = {"version": EXPORT_TEMPLATE_CONFIG_VERSION, "templates": [
+        export_template_to_dict(t) for t in templates
+        if t.template_id != WERKLOGGER_EXPORT_TEMPLATE.template_id
+    ]}
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            json.dump(payload, handle, ensure_ascii=False, indent=2)
-            handle.flush(); os.fsync(handle.fileno())
-        os.replace(temp_name, destination)
-    except Exception:
-        try: os.unlink(temp_name)
-        except OSError: pass
+        if destination.exists():
+            _decode_export_template_config(destination)
+            _atomic_write(destination.with_suffix(destination.suffix + ".bak"),
+                          destination.read_text(encoding="utf-8"))
+        _atomic_write(destination, json.dumps(document, ensure_ascii=False, indent=2) + "\n")
+    except ExportTemplateConfigurationError:
         raise
+    except (OSError, UnicodeError) as exc:
+        raise ExportTemplateConfigurationError(
+            f"Could not write export-template configuration {destination}: {exc}"
+        ) from exc
 
 
 def resolve_export_template(template: Optional[ExportTemplate]) -> ExportTemplate:
@@ -1939,7 +2006,7 @@ if tk is not None:
             data["field_labels"] = {key: variable.get().strip() for key, variable in self.label_vars.items()}
             self.templates[index] = export_template_from_dict(data)
             try: save_export_templates(self.templates)
-            except OSError as exc:
+            except ExportTemplateConfigurationError as exc:
                 messagebox.showerror("Cannot save template", str(exc), parent=self); return
             self.app.set_export_templates(self.templates, self.templates[index].template_id)
             self._refresh_list(index)
@@ -1953,7 +2020,15 @@ if tk is not None:
     
             self.zip_path: Optional[Path] = None
             self.out_dir: Optional[Path] = None
-            self.export_templates = load_export_templates()
+            try:
+                self.export_templates = load_export_templates()
+            except ExportTemplateConfigurationError as exc:
+                if exc.recovered_templates is not None:
+                    self.export_templates = exc.recovered_templates
+                    messagebox.showwarning("Export templates recovered", str(exc), parent=self)
+                else:
+                    self.export_templates = [WERKLOGGER_EXPORT_TEMPLATE]
+                    messagebox.showerror("Export-template configuration error", str(exc), parent=self)
     
             frm = tk.Frame(self)
             frm.pack(fill="x", padx=10, pady=10)
