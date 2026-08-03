@@ -118,6 +118,17 @@ def test_template_serialization_round_trips_all_output_and_layout_settings():
     assert restored == original
 
 
+def test_template_json_storage_preserves_pagesize_tuple(tmp_path):
+    original = _custom()
+    destination = tmp_path / "templates.json"
+
+    app.save_export_templates([original], destination)
+    restored = app.load_export_templates(destination)[1]
+
+    assert restored == original
+    assert isinstance(restored.page_settings["pagesize"], tuple)
+
+
 @pytest.mark.parametrize(
     "pattern",
     ["{building_id.__class__}.pdf", "{project_name[0]}.pdf", "{building_id!r}.pdf",
