@@ -63,6 +63,23 @@ editable display name. Always use the ID in scripts.
 
 You can still use `run_worklogger.command` on macOS if you already have Python installed; it will install dependencies and launch the GUI.
 
+## Create a CSV-based export template
+
+Open **Manage templates...** and choose **New**. Select an example CSV export when
+prompted. Worklogger stores only its column names, not the example data. In the
+**CSV column mapping** tab you can then:
+
+- map renamed CSV columns to the standard import purposes (ID, type, label,
+  answer, media, and so on); and
+- optionally map a CSV column directly to each PDF field, such as Building ID,
+  project name, address, or report date.
+
+The other tabs continue to control the shared report layout, section order,
+labels, text, colors, photo grid, and output files. This allows templates to use
+the same visual layout while supporting exports with different column names and
+purposes. The selected template's mapping is automatically applied when its ZIP
+is processed.
+
 ## Run the test suite
 
 The tests create isolated temporary directories and generate their own CSV, JPEG,
