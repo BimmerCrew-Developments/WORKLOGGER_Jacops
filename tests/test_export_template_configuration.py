@@ -76,6 +76,34 @@ def test_unsupported_configuration_version_is_rejected(tmp_path):
         app.load_export_templates(destination)
 
 
+def test_old_template_branding_receives_new_report_text_defaults(tmp_path):
+    custom = _custom()
+    document = app.export_template_to_dict(custom)
+    document["branding"] = {"report_title": "Oud rapport", "photo_title": "Foto's"}
+    destination = tmp_path / "templates.json"
+    destination.write_text(json.dumps({"version": 1, "templates": [document]}), encoding="utf-8")
+
+    loaded = app.load_export_templates(destination)[1]
+
+    assert loaded.branding["section_lmra"] == "LMRA Checklist:"
+    assert loaded.branding["lmra_status"] == "LMRA Status: OK - Werk kan worden uitgevoerd"
+    assert loaded.branding["photo_title"] == "Foto's:"
+
+
+def test_required_report_text_is_validated_on_load_and_save(tmp_path):
+    invalid = replace(_custom(), branding={**app.DEFAULT_TEMPLATE_BRANDING, "lmra_status": ""})
+
+    with pytest.raises(app.ExportTemplateConfigurationError, match="invalid template"):
+        app.save_export_templates([invalid], tmp_path / "templates.json")
+
+    document = app.export_template_to_dict(_custom())
+    document["branding"]["section_address"] = ""
+    destination = tmp_path / "invalid-load.json"
+    destination.write_text(json.dumps({"version": 1, "templates": [document]}), encoding="utf-8")
+    with pytest.raises(app.ExportTemplateConfigurationError, match="Could not read"):
+        app.load_export_templates(destination)
+
+
 def test_valid_backup_recovers_and_preserves_damaged_document(tmp_path):
     destination = tmp_path / "templates.json"
     first = _custom("first", "First")
