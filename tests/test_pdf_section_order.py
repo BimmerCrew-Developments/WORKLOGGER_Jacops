@@ -64,3 +64,29 @@ def test_custom_section_order_is_reflected_in_extracted_pdf_text(tmp_path):
         second_text,
         ["Gebruikte materialen:", "Uitgevoerde Werken - Details:", "Adresgegevens:"],
     )
+
+
+def test_custom_headings_and_lmra_copy_are_present_in_extracted_pdf_text(tmp_path):
+    branding = {
+        **WERKLOGGER_EXPORT_TEMPLATE.branding,
+        "section_address": "Projectadres:",
+        "section_lmra": "Veiligheidscontrole:",
+        "lmra_status": "Controle akkoord - werkzaamheden toegestaan",
+        "lmra_item_1": "Aangepast veiligheidsitem",
+        "yes_label": "GOED",
+    }
+    template = replace(
+        WERKLOGGER_EXPORT_TEMPLATE,
+        template_id="custom-report-copy",
+        branding=branding,
+    )
+    output = tmp_path / "custom-report-copy.pdf"
+
+    build_pdf(output, _report(), template)
+    text = "\n".join(page.extract_text() or "" for page in PdfReader(output).pages)
+
+    assert "Projectadres:" in text
+    assert "Veiligheidscontrole:" in text
+    assert "Controle akkoord - werkzaamheden toegestaan" in text
+    assert "Aangepast veiligheidsitem" in text
+    assert "GOED" in text

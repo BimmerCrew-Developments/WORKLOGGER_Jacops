@@ -178,13 +178,38 @@ class ExportTemplate:
     layout: Mapping[str, Any] = field(default_factory=dict)
 
 
+# All report copy which is not sourced from the CSV lives here.  Keeping these
+# keys together makes old template documents straightforward to migrate.
+DEFAULT_TEMPLATE_BRANDING: Mapping[str, str] = {
+    "report_title": "WERKLOGGER RAPPORT",
+    "section_address": "Adresgegevens:",
+    "section_lmra": "LMRA Checklist:",
+    "section_work_details": "Uitgevoerde Werken - Details:",
+    "section_materials": "Gebruikte materialen:",
+    "section_post_registrations": "Post Afmeldingen:",
+    "section_continuation_pattern": "{title} (vervolg):",
+    "lmra_status": "LMRA Status: OK - Werk kan worden uitgevoerd",
+    "lmra_item_1": "Veiligheidsrisico's geïdentificeerd",
+    "lmra_item_2": "Juiste PBM aanwezig",
+    "lmra_item_3": "Werknemers geïnformeerd",
+    "lmra_item_4": "Noodprocedures bekend",
+    "lmra_item_5": "Werkgebied afgezet",
+    "lmra_item_6": "Vergunningen aanwezig",
+    "yes_label": "JA",
+    "no_label": "NEE",
+    "photo_title": "Foto's:",
+    "photo_continuation_title": "Foto's (vervolg):",
+}
+REQUIRED_BRANDING_KEYS = frozenset(DEFAULT_TEMPLATE_BRANDING)
+
+
 # This is the compatibility template.  Its values are the measurements and copy
 # used by the original WERKLOGGER renderer.
 WERKLOGGER_EXPORT_TEMPLATE = ExportTemplate(
     template_id="werklogger-report-v1",
     display_name="WERKLOGGER RAPPORT",
     page_settings={"pagesize": A4, "bottom_y": 70.0},
-    branding={"report_title": "WERKLOGGER RAPPORT", "photo_title": "Foto's"},
+    branding=DEFAULT_TEMPLATE_BRANDING,
     colors={
         "primary": (0.702, 0.0, 0.0), "secondary": (0.549, 0.427, 0.0),
         "status_bar": (0.83, 0.93, 0.85), "status_yes": (0.2, 0.6, 0.2),
@@ -223,10 +248,10 @@ TEMPLATE_SECTIONS = (
     ("work_details", "Work details"), ("materials", "Materials"),
     ("post_registrations", "Post registrations"), ("photos", "Photos"),
 )
-SECTION_TITLES = {
-    "address": "Adresgegevens:", "lmra": "LMRA Checklist:",
-    "work_details": "Uitgevoerde Werken - Details:",
-    "materials": "Gebruikte materialen:", "post_registrations": "Post Afmeldingen:",
+SECTION_BRANDING_KEYS = {
+    "address": "section_address", "lmra": "section_lmra",
+    "work_details": "section_work_details", "materials": "section_materials",
+    "post_registrations": "section_post_registrations",
 }
 FILENAME_PLACEHOLDERS = frozenset({"building_id", "project_name", "report_datetime"})
 
@@ -340,9 +365,15 @@ def export_template_to_dict(template: ExportTemplate) -> Dict[str, Any]:
 
 def export_template_from_dict(data: Mapping[str, Any]) -> ExportTemplate:
     """Build and validate a custom template from untrusted JSON data."""
+    # Templates written by earlier releases only have report_title/photo_title.
+    # Defaults are intentionally applied only to absent keys: explicitly blank
+    # required copy remains a validation error rather than being silently fixed.
+    branding = {**DEFAULT_TEMPLATE_BRANDING, **dict(data["branding"])}
+    if branding.get("photo_title") == "Foto's":
+        branding["photo_title"] = DEFAULT_TEMPLATE_BRANDING["photo_title"]
     template = ExportTemplate(
         template_id=str(data["template_id"]), display_name=str(data["display_name"]),
-        page_settings=dict(data["page_settings"]), branding=dict(data["branding"]),
+        page_settings=dict(data["page_settings"]), branding=branding,
         colors={key: tuple(value) for key, value in dict(data["colors"]).items()},
         enabled_sections=tuple(data["enabled_sections"]), section_order=tuple(data["section_order"]),
         section_fields={str(k): tuple(v) for k, v in dict(data.get("section_fields", SECTION_FIELD_KEYS)).items()},
@@ -536,6 +567,10 @@ def resolve_export_template(template: Optional[ExportTemplate]) -> ExportTemplat
             and set(template.field_labels).issubset(EXPORT_FIELD_REGISTRY)
             and required_colors.issubset(template.colors)
             and required_grid.issubset(template.photo_grid)
+            and REQUIRED_BRANDING_KEYS.issubset(template.branding)
+            and all(isinstance(template.branding[key], str) and template.branding[key].strip()
+                    for key in REQUIRED_BRANDING_KEYS)
+            and "{title}" in template.branding["section_continuation_pattern"]
             and bool(calculate_photo_grid_geometry(template.page_settings, template.photo_grid))
         )
         if valid:
@@ -1447,7 +1482,7 @@ class _Page1RenderContext:
 
 def _render_address_section(ctx: _Page1RenderContext, y: float) -> float:
     y = ctx.ensure_space(y, 145.0)
-    ctx.draw_section_title(SECTION_TITLES["address"], y, ctx.template.colors["primary"])
+    ctx.draw_section_title(ctx.template.branding["section_address"], y, ctx.template.colors["primary"])
     row_y = y - 24.6844
     for key in ctx.template.section_fields["address"]:
         ctx.canvas.setFont("Helvetica-Bold", 10)
@@ -1461,23 +1496,21 @@ def _render_address_section(ctx: _Page1RenderContext, y: float) -> float:
 def _render_lmra_section(ctx: _Page1RenderContext, y: float) -> float:
     y = ctx.ensure_space(y, 165.0)
     c, layout = ctx.canvas, ctx.template.layout
-    ctx.draw_section_title(SECTION_TITLES["lmra"], y, ctx.template.colors["primary"])
+    ctx.draw_section_title(ctx.template.branding["section_lmra"], y, ctx.template.colors["primary"])
     bar_y = y - 42.4573
     c.setFillColorRGB(*ctx.template.colors["status_bar"])
     c.rect(layout["left"], bar_y, layout["right"] - layout["left"], 19.8425, stroke=0, fill=1)
     c.setFillColorRGB(0, 0, 0)
     c.setFont("Helvetica", 11)
     c.drawCentredString((layout["left"] + layout["right"]) / 2.0, bar_y + 5.0,
-                        "LMRA Status: OK - Werk kan worden uitgevoerd")
+                        ctx.template.branding["lmra_status"])
     row_y = y - 58.7014
-    for item in ("Veiligheidsrisico's geïdentificeerd", "Juiste PBM aanwezig",
-                 "Werknemers geïnformeerd", "Noodprocedures bekend",
-                 "Werkgebied afgezet", "Vergunningen aanwezig"):
+    for item in (ctx.template.branding[f"lmra_item_{index}"] for index in range(1, 7)):
         c.setFillColorRGB(0, 0, 0)
         c.setFont("Helvetica-Bold", 10)
         c.drawString(layout["left"], row_y, item)
         c.setFillColorRGB(*ctx.template.colors["status_yes"])
-        c.drawString(layout["checklist_yes_x"], row_y, "JA")
+        c.drawString(layout["checklist_yes_x"], row_y, ctx.template.branding["yes_label"])
         row_y -= layout["line_spacing"]
     c.setFillColorRGB(0, 0, 0)
     return y - 175.75
@@ -1485,7 +1518,7 @@ def _render_lmra_section(ctx: _Page1RenderContext, y: float) -> float:
 
 def _render_work_details_section(ctx: _Page1RenderContext, y: float) -> float:
     y = ctx.ensure_space(y, 65.0)
-    ctx.draw_section_title(SECTION_TITLES["work_details"], y, ctx.template.colors["primary"])
+    ctx.draw_section_title(ctx.template.branding["section_work_details"], y, ctx.template.colors["primary"])
     row_y = y - 24.6758
     for key in ctx.template.section_fields["work_details"]:
         ctx.canvas.setFont("Helvetica-Bold", 10)
@@ -1499,7 +1532,7 @@ def _render_work_details_section(ctx: _Page1RenderContext, y: float) -> float:
 def _render_bullet_section(ctx: _Page1RenderContext, y: float, section: str) -> float:
     raw = ctx.value(ctx.template.section_fields[section][0])
     lines = list(raw if isinstance(raw, list) else [raw])
-    title = SECTION_TITLES[section]
+    title = ctx.template.branding[SECTION_BRANDING_KEYS[section]]
     dy = ctx.template.layout["line_spacing"]
     while True:
         y = ctx.ensure_space(y, 24.6898 + dy)
@@ -1521,7 +1554,8 @@ def _render_bullet_section(ctx: _Page1RenderContext, y: float, section: str) -> 
         if not remaining:
             return text_y - 14.0
         y = ctx.new_page()
-        title = SECTION_TITLES[section].rstrip(":") + " (vervolg):"
+        title = ctx.template.branding["section_continuation_pattern"].replace(
+            "{title}", ctx.template.branding[SECTION_BRANDING_KEYS[section]].rstrip(":"))
         lines = remaining
 
 
@@ -1589,7 +1623,8 @@ def render_photos_pages(c: Canvas, report: ReportRow, template: Optional[ExportT
     def draw_page_heading(first: bool) -> None:
         c.setFillColorRGB(*RED)
         c.setFont("Helvetica", 14)
-        c.drawString(X_LEFT, heading_y, f"{template.branding['photo_title']}:" if first else f"{template.branding['photo_title']} (vervolg):")
+        key = "photo_title" if first else "photo_continuation_title"
+        c.drawString(X_LEFT, heading_y, template.branding[key])
         c.setStrokeColorRGB(*RED)
         c.setLineWidth(LINE_W)
         c.line(X_LEFT, underline_y, X_RIGHT, underline_y)
@@ -1916,9 +1951,10 @@ if tk is not None:
             self.readonly_note.pack(anchor="w")
             book = ttk.Notebook(right); book.pack(fill="both", expand=True, pady=5)
             general = ttk.Frame(book, padding=8); sections = ttk.Frame(book, padding=8)
-            labels = ttk.Frame(book, padding=8)
+            labels = ttk.Frame(book, padding=8); text_tab = ttk.Frame(book, padding=8)
             book.add(general, text="Report & photos"); book.add(sections, text="Sections")
             book.add(labels, text="CSV-backed fields / labels")
+            book.add(text_tab, text="Report text")
 
             self.name_var = tk.StringVar(); self.title_var = tk.StringVar(); self.pattern_var = tk.StringVar()
             self.fallback_var = tk.StringVar()
@@ -1973,6 +2009,23 @@ if tk is not None:
                 ttk.Label(label_frame, text=key, width=22).grid(row=row, column=0, sticky="w", pady=2)
                 ttk.Entry(label_frame, textvariable=variable, width=42).grid(row=row, column=1, sticky="ew", pady=2)
 
+            text_canvas = tk.Canvas(text_tab, highlightthickness=0)
+            text_scroll = ttk.Scrollbar(text_tab, command=text_canvas.yview)
+            text_frame = ttk.Frame(text_canvas)
+            text_canvas.create_window((0, 0), window=text_frame, anchor="nw")
+            text_canvas.configure(yscrollcommand=text_scroll.set)
+            text_canvas.pack(side="left", fill="both", expand=True)
+            text_scroll.pack(side="right", fill="y")
+            text_frame.bind("<Configure>", lambda _e: text_canvas.configure(scrollregion=text_canvas.bbox("all")))
+            self.branding_vars = {
+                key: tk.StringVar() for key in DEFAULT_TEMPLATE_BRANDING if key != "report_title"
+            }
+            for row, (key, variable) in enumerate(self.branding_vars.items()):
+                ttk.Label(text_frame, text=key.replace("_", " ").title(), width=32).grid(
+                    row=row, column=0, sticky="w", pady=2)
+                ttk.Entry(text_frame, textvariable=variable, width=55).grid(
+                    row=row, column=1, sticky="ew", pady=2)
+
             footer = ttk.Frame(right); footer.pack(fill="x")
             ttk.Button(footer, text="Save changes", command=self._save).pack(side="right")
             ttk.Button(footer, text="Close", command=self.destroy).pack(side="right", padx=6)
@@ -2010,6 +2063,7 @@ if tk is not None:
             self.order_list.delete(0, "end")
             for section in template.section_order: self.order_list.insert("end", section)
             for key, variable in self.label_vars.items(): variable.set(template.field_labels[key])
+            for key, variable in self.branding_vars.items(): variable.set(template.branding[key])
 
         def _new(self) -> None:
             self._append_copy(WERKLOGGER_EXPORT_TEMPLATE, "New template")
@@ -2064,6 +2118,10 @@ if tk is not None:
                                               current.page_settings, current.photo_grid)
             if any(not variable.get().strip() for variable in self.label_vars.values()):
                 errors.append("All display labels are required.")
+            if any(not variable.get().strip() for variable in self.branding_vars.values()):
+                errors.append("All report text values are required.")
+            if "{title}" not in self.branding_vars["section_continuation_pattern"].get():
+                errors.append("Section continuation pattern must contain {title}.")
             if any(t.display_name.casefold() == self.name_var.get().strip().casefold() and i != index
                    for i, t in enumerate(self.templates)):
                 errors.append("Template names must be unique.")
@@ -2074,6 +2132,8 @@ if tk is not None:
                         empty_value_fallback=self.fallback_var.get(), enabled_sections=enabled, section_order=order)
             data.update({key: variable.get() for key, variable in self.output_flag_vars.items()})
             data["branding"]["report_title"] = self.title_var.get().strip()
+            data["branding"].update({key: variable.get().strip()
+                                     for key, variable in self.branding_vars.items()})
             data["colors"] = {key: [int(value.get().strip()[i:i+2], 16) / 255 for i in (1, 3, 5)] for key, value in self.color_vars.items()}
             data["photo_grid"].update(rows=int(self.rows_var.get()), columns=int(self.columns_var.get()))
             data["field_labels"] = {key: variable.get().strip() for key, variable in self.label_vars.items()}
