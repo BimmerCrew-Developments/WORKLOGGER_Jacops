@@ -975,7 +975,9 @@ def project_default_template(project: ProjectRecord, templates: List[ExportTempl
 REQUIRED_COLUMNS = ["ID", "Type", "Label", "Primary", "Secondary", "Note", "Media"]
 
 
-def find_header_row(csv_path: Path, column_mapping: Optional[Mapping[str, str]] = None) -> int:
+def find_header_row(csv_path: Path, column_mapping: Optional[Mapping[str, str]] = None,
+                    configured_row: Optional[int] = None,
+                    column_count: Optional[int] = None) -> int:
     """Find the header row index (0-based) that contains required columns."""
     with csv_path.open("r", encoding="utf-8-sig", newline="") as f:
         reader = csv.reader(f)
@@ -991,6 +993,19 @@ def find_header_row(csv_path: Path, column_mapping: Optional[Mapping[str, str]] 
             if all(c in cols for c in required):
                 return idx
     raise ValueError("Could not find CSV header row with required columns.")
+
+
+def read_csv_preview(csv_path: Path, limit: int = 100) -> List[Tuple[str, ...]]:
+    """Read CSV rows for the schema preview without interpreting a header."""
+    rows: List[Tuple[str, ...]] = []
+    with csv_path.open("r", encoding="utf-8-sig", newline="") as handle:
+        for row in csv.reader(handle):
+            rows.append(tuple(cell.strip() for cell in row))
+            if len(rows) >= limit:
+                break
+    if not rows:
+        raise ValueError("The selected CSV is empty.")
+    return rows
 
 
 def inspect_csv_headers(csv_path: Path) -> Tuple[str, ...]:
@@ -1009,13 +1024,17 @@ def inspect_csv_headers(csv_path: Path) -> Tuple[str, ...]:
     return headers
 
 
-def read_first_csv_values(csv_path: Path, header_idx: int) -> Dict[str, str]:
+def read_first_csv_values(csv_path: Path, header_idx: int,
+                          column_count: Optional[int] = None) -> Dict[str, str]:
     """Return the first non-empty value per source column for direct PDF mappings."""
     values: Dict[str, str] = {}
     with csv_path.open("r", encoding="utf-8-sig", newline="") as handle:
         for _ in range(header_idx):
             next(handle)
-        for row in csv.DictReader(handle):
+        reader = csv.reader(handle)
+        headers = [value.strip() for value in next(reader)[:column_count]]
+        for values in reader:
+            row = dict(zip(headers, values[:len(headers)]))
             for key, value in row.items():
                 cleaned = (value or "").strip()
                 if key and cleaned:
@@ -1023,10 +1042,12 @@ def read_first_csv_values(csv_path: Path, header_idx: int) -> Dict[str, str]:
     return values
 
 
-def load_audit_csv(csv_path: Path, column_mapping: Optional[Mapping[str, str]] = None) -> Tuple[Dict[str, str], Dict[str, str], List[MediaRow], List[AuditRow]]:
+def load_audit_csv(csv_path: Path, column_mapping: Optional[Mapping[str, str]] = None,
+                   header_row: Optional[int] = None,
+                   column_count: Optional[int] = None) -> Tuple[Dict[str, str], Dict[str, str], List[MediaRow], List[AuditRow]]:
     """Load SafetyAuditor export CSV and return meta, field-values, media rows, audit rows."""
     mapping = dict(column_mapping or {})
-    header_idx = find_header_row(csv_path, mapping)
+    header_idx = find_header_row(csv_path, mapping, header_row, column_count)
     source = lambda raw, key: raw.get(mapping.get(key, key))  # noqa: E731
 
     audit_rows: List[AuditRow] = []
@@ -1035,8 +1056,10 @@ def load_audit_csv(csv_path: Path, column_mapping: Optional[Mapping[str, str]] =
         for _ in range(header_idx):
             f.readline()
 
-        reader = csv.DictReader(f)
-        for raw in reader:
+        reader = csv.reader(f)
+        headers = [value.strip() for value in next(reader)[:column_count]]
+        for values in reader:
+            raw = dict(zip(headers, values[:len(headers)]))
             rid = (source(raw, "ID") or "").strip()
             row = AuditRow(
                 row_id=rid,
@@ -1837,9 +1860,15 @@ def process_zip_to_folder_and_pdf(zip_path: Path, out_dir: Path, project_overrid
         _log(f"Found CSV: {csv_path.name}")
 
         template = resolve_export_template(template)
-        header_idx = find_header_row(csv_path, template.csv_column_mapping)
-        meta, fields, media_rows, audit_rows = load_audit_csv(csv_path, template.csv_column_mapping)
-        direct_values = read_first_csv_values(csv_path, header_idx)
+        header_idx = find_header_row(
+            csv_path, template.csv_column_mapping,
+            template.csv_header_row, template.csv_column_count,
+        )
+        meta, fields, media_rows, audit_rows = load_audit_csv(
+            csv_path, template.csv_column_mapping,
+            template.csv_header_row, template.csv_column_count,
+        )
+        direct_values = read_first_csv_values(csv_path, header_idx, template.csv_column_count)
 
         # Extract materials/work tables (preferred)
         mat_articles, work_articles = extract_articles_from_csv(audit_rows)
