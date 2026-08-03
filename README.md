@@ -66,11 +66,8 @@ You can still use `run_worklogger.command` on macOS if you already have Python i
 ## Create a CSV-based export template
 
 Open **Manage templates...** and choose **New**. Select an example CSV export when
-prompted. A table preview lets you choose the row containing the column names and
-how many leading columns belong to the export table, so introductory CSV rows and
-unrelated trailing columns can be excluded. Worklogger stores only the selected
-column names and range, not the example data. In the **CSV column mapping** tab
-you can then:
+prompted. Worklogger stores only its column names, not the example data. In the
+**CSV column mapping** tab you can then:
 
 - map renamed CSV columns to the standard import purposes (ID, type, label,
   answer, media, and so on); and

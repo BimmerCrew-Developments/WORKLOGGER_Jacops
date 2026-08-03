@@ -182,8 +182,6 @@ class ExportTemplate:
     csv_headers: Tuple[str, ...] = ()
     csv_column_mapping: Mapping[str, str] = field(default_factory=dict)
     pdf_field_columns: Mapping[str, str] = field(default_factory=dict)
-    csv_header_row: Optional[int] = None
-    csv_column_count: Optional[int] = None
 
 
 # All report copy which is not sourced from the CSV lives here.  Keeping these
@@ -376,8 +374,6 @@ def export_template_to_dict(template: ExportTemplate) -> Dict[str, Any]:
         "csv_headers": list(template.csv_headers),
         "csv_column_mapping": dict(template.csv_column_mapping),
         "pdf_field_columns": dict(template.pdf_field_columns),
-        "csv_header_row": template.csv_header_row,
-        "csv_column_count": template.csv_column_count,
     }
 
 
@@ -411,8 +407,6 @@ def export_template_from_dict(data: Mapping[str, Any]) -> ExportTemplate:
         csv_headers=tuple(str(value) for value in data.get("csv_headers", ())),
         csv_column_mapping={str(k): str(v) for k, v in dict(data.get("csv_column_mapping", {})).items()},
         pdf_field_columns={str(k): str(v) for k, v in dict(data.get("pdf_field_columns", {})).items()},
-        csv_header_row=(int(data["csv_header_row"]) if data.get("csv_header_row") is not None else None),
-        csv_column_count=(int(data["csv_column_count"]) if data.get("csv_column_count") is not None else None),
     )
     if resolve_export_template(template) is not template:
         raise ValueError("Invalid export template")
@@ -598,8 +592,6 @@ def resolve_export_template(template: Optional[ExportTemplate]) -> ExportTemplat
             and set(template.pdf_field_columns).issubset(PDF_COLUMN_FIELDS)
             and all(value in template.csv_headers for value in template.csv_column_mapping.values())
             and all(value in template.csv_headers for value in template.pdf_field_columns.values())
-            and (template.csv_header_row is None or template.csv_header_row >= 0)
-            and (template.csv_column_count is None or template.csv_column_count > 0)
             and REQUIRED_BRANDING_KEYS.issubset(template.branding)
             and all(isinstance(template.branding[key], str) and template.branding[key].strip()
                     for key in REQUIRED_BRANDING_KEYS)
@@ -983,9 +975,7 @@ def project_default_template(project: ProjectRecord, templates: List[ExportTempl
 REQUIRED_COLUMNS = ["ID", "Type", "Label", "Primary", "Secondary", "Note", "Media"]
 
 
-def find_header_row(csv_path: Path, column_mapping: Optional[Mapping[str, str]] = None,
-                    configured_row: Optional[int] = None,
-                    column_count: Optional[int] = None) -> int:
+def find_header_row(csv_path: Path, column_mapping: Optional[Mapping[str, str]] = None) -> int:
     """Find the header row index (0-based) that contains required columns."""
     with csv_path.open("r", encoding="utf-8-sig", newline="") as f:
         reader = csv.reader(f)
@@ -1003,77 +993,62 @@ def find_header_row(csv_path: Path, column_mapping: Optional[Mapping[str, str]] 
     raise ValueError("Could not find CSV header row with required columns.")
 
 
-def read_csv_preview(csv_path: Path, limit: int = 100) -> List[Tuple[str, ...]]:
-    """Read CSV rows for the schema preview without interpreting a header."""
-    rows: List[Tuple[str, ...]] = []
+def inspect_csv_headers(csv_path: Path) -> Tuple[str, ...]:
+    """Read the first widest row, allowing metadata lines before the header."""
+    candidate: Tuple[str, ...] = ()
     with csv_path.open("r", encoding="utf-8-sig", newline="") as handle:
         for row in csv.reader(handle):
-            rows.append(tuple(cell.strip() for cell in row))
-            if len(rows) >= limit:
-                break
-    if not rows:
-        raise ValueError("The selected CSV is empty.")
-    return rows
-
-
-def inspect_csv_headers(csv_path: Path, header_row: int,
-                        column_count: int) -> Tuple[str, ...]:
-    """Return the explicitly selected header row and leading columns."""
-    rows = read_csv_preview(csv_path, header_row + 1)
-    if not 0 <= header_row < len(rows):
-        raise ValueError("The selected table start row is outside the CSV.")
-    headers = tuple(rows[header_row][:column_count])
-    if len(headers) != column_count:
-        raise ValueError("The selected table start row has fewer columns than requested.")
-    if not headers or any(not value for value in headers) or len(headers) != len(set(headers)):
+            values = tuple(cell.strip() for cell in row)
+            if len(values) > len(candidate):
+                candidate = values
+    headers = tuple(value for value in candidate if value)
+    if not headers:
+        raise ValueError("The selected CSV does not contain a header row.")
+    if len(headers) != len(candidate) or len(headers) != len(set(headers)):
         raise ValueError("CSV template column names must be non-empty and unique.")
     return headers
 
 
-def _read_csv_dict_rows(csv_path: Path, header_idx: int,
-                        column_count: Optional[int] = None) -> List[Dict[str, str]]:
-    with csv_path.open("r", encoding="utf-8-sig", newline="") as handle:
-        reader = csv.reader(handle)
-        for _ in range(header_idx):
-            next(reader)
-        headers = [value.strip() for value in next(reader)[:column_count]]
-        return [dict(zip(headers, row[:len(headers)])) for row in reader]
-
-
-def read_first_csv_values(csv_path: Path, header_idx: int,
-                          column_count: Optional[int] = None) -> Dict[str, str]:
+def read_first_csv_values(csv_path: Path, header_idx: int) -> Dict[str, str]:
     """Return the first non-empty value per source column for direct PDF mappings."""
     values: Dict[str, str] = {}
-    for row in _read_csv_dict_rows(csv_path, header_idx, column_count):
-        for key, value in row.items():
-            cleaned = (value or "").strip()
-            if key and cleaned:
-                values.setdefault(key.strip(), cleaned)
+    with csv_path.open("r", encoding="utf-8-sig", newline="") as handle:
+        for _ in range(header_idx):
+            next(handle)
+        for row in csv.DictReader(handle):
+            for key, value in row.items():
+                cleaned = (value or "").strip()
+                if key and cleaned:
+                    values.setdefault(key.strip(), cleaned)
     return values
 
 
-def load_audit_csv(csv_path: Path, column_mapping: Optional[Mapping[str, str]] = None,
-                   header_row: Optional[int] = None,
-                   column_count: Optional[int] = None) -> Tuple[Dict[str, str], Dict[str, str], List[MediaRow], List[AuditRow]]:
+def load_audit_csv(csv_path: Path, column_mapping: Optional[Mapping[str, str]] = None) -> Tuple[Dict[str, str], Dict[str, str], List[MediaRow], List[AuditRow]]:
     """Load SafetyAuditor export CSV and return meta, field-values, media rows, audit rows."""
     mapping = dict(column_mapping or {})
-    header_idx = find_header_row(csv_path, mapping, header_row, column_count)
+    header_idx = find_header_row(csv_path, mapping)
     source = lambda raw, key: raw.get(mapping.get(key, key))  # noqa: E731
 
     audit_rows: List[AuditRow] = []
-    for raw in _read_csv_dict_rows(csv_path, header_idx, column_count):
-        rid = (source(raw, "ID") or "").strip()
-        row = AuditRow(
-            row_id=rid,
-            parent_id=(source(raw, "Parent ID") or raw.get("ParentID") or raw.get("Parent") or "").strip(),
-            row_type=(source(raw, "Type") or "").strip(),
-            label=(source(raw, "Label") or "").strip(),
-            primary=(source(raw, "Primary") or "").strip(),
-            secondary=(source(raw, "Secondary") or "").strip(),
-            note=(source(raw, "Note") or "").strip(),
-            media=(source(raw, "Media") or "").strip(),
-        )
-        audit_rows.append(row)
+    with csv_path.open("r", encoding="utf-8-sig", newline="") as f:
+        # skip to header
+        for _ in range(header_idx):
+            f.readline()
+
+        reader = csv.DictReader(f)
+        for raw in reader:
+            rid = (source(raw, "ID") or "").strip()
+            row = AuditRow(
+                row_id=rid,
+                parent_id=(source(raw, "Parent ID") or raw.get("ParentID") or raw.get("Parent") or "").strip(),
+                row_type=(source(raw, "Type") or "").strip(),
+                label=(source(raw, "Label") or "").strip(),
+                primary=(source(raw, "Primary") or "").strip(),
+                secondary=(source(raw, "Secondary") or "").strip(),
+                note=(source(raw, "Note") or "").strip(),
+                media=(source(raw, "Media") or "").strip(),
+            )
+            audit_rows.append(row)
 
     # Meta fields (from typical exports)
     meta: Dict[str, str] = {}
@@ -1862,12 +1837,9 @@ def process_zip_to_folder_and_pdf(zip_path: Path, out_dir: Path, project_overrid
         _log(f"Found CSV: {csv_path.name}")
 
         template = resolve_export_template(template)
-        header_idx = find_header_row(csv_path, template.csv_column_mapping,
-                                     template.csv_header_row, template.csv_column_count)
-        meta, fields, media_rows, audit_rows = load_audit_csv(
-            csv_path, template.csv_column_mapping,
-            template.csv_header_row, template.csv_column_count)
-        direct_values = read_first_csv_values(csv_path, header_idx, template.csv_column_count)
+        header_idx = find_header_row(csv_path, template.csv_column_mapping)
+        meta, fields, media_rows, audit_rows = load_audit_csv(csv_path, template.csv_column_mapping)
+        direct_values = read_first_csv_values(csv_path, header_idx)
 
         # Extract materials/work tables (preferred)
         mat_articles, work_articles = extract_articles_from_csv(audit_rows)
@@ -2274,9 +2246,7 @@ if tk is not None:
             for key, variable in self.label_vars.items(): variable.set(template.field_labels[key])
             for key, variable in self.branding_vars.items(): variable.set(template.branding[key])
             choices = ("", *template.csv_headers)
-            range_text = (f"table row {template.csv_header_row + 1}, "
-                          if template.csv_header_row is not None else "")
-            self.csv_schema_note.config(text=(f"{range_text}{len(template.csv_headers)} columns loaded: " + ", ".join(template.csv_headers))
+            self.csv_schema_note.config(text=(f"{len(template.csv_headers)} columns loaded: " + ", ".join(template.csv_headers))
                                         if template.csv_headers else "No uploaded CSV schema; standard column names are used.")
             for key, variable in self.csv_role_vars.items():
                 self.csv_role_boxes[key]["values"] = choices
@@ -2291,16 +2261,12 @@ if tk is not None:
             if not path:
                 return
             try:
-                preview = CsvSchemaPreviewDialog(self, Path(path))
+                headers = inspect_csv_headers(Path(path))
             except (OSError, UnicodeError, ValueError) as exc:
                 messagebox.showerror("Invalid CSV template", str(exc), parent=self); return
-            if preview.result is None:
-                return
-            header_row, column_count, headers = preview.result
             data = export_template_to_dict(WERKLOGGER_EXPORT_TEMPLATE)
             data.update(template_id="custom-" + uuid.uuid4().hex, display_name="New template",
-                        csv_headers=list(headers), csv_header_row=header_row,
-                        csv_column_count=column_count)
+                        csv_headers=list(headers))
             folded = {header.casefold(): header for header in headers}
             data["csv_column_mapping"] = {
                 role: folded[role.casefold()] for role in CSV_COLUMN_ROLES if role.casefold() in folded
