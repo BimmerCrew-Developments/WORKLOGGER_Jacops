@@ -129,6 +129,68 @@ def test_template_json_storage_preserves_pagesize_tuple(tmp_path):
     assert isinstance(restored.page_settings["pagesize"], tuple)
 
 
+def test_uploaded_csv_schema_and_column_mappings_round_trip():
+    original = replace(
+        _custom(), csv_headers=("Record", "Kind", "Caption", "Answer", "Files"),
+        csv_column_mapping={"ID": "Record", "Type": "Kind", "Label": "Caption",
+                            "Primary": "Answer", "Media": "Files"},
+        pdf_field_columns={"building_id": "Record", "project_name": "Answer"},
+        csv_header_row=3, csv_column_count=5,
+    )
+
+    restored = app.export_template_from_dict(app.export_template_to_dict(original))
+
+    assert restored.csv_headers == original.csv_headers
+    assert restored.csv_column_mapping == original.csv_column_mapping
+    assert restored.pdf_field_columns == original.pdf_field_columns
+    assert restored.csv_header_row == 3
+    assert restored.csv_column_count == 5
+
+
+def test_custom_csv_column_names_are_used_for_import_and_direct_values(tmp_path):
+    source = tmp_path / "custom.csv"
+    source.write_text(
+        "Record,Kind,Caption,Answer,Extra,Comment,Files\n"
+        "1,text,Building,BLD-42,,,\n"
+        "2,media,Overview,,,,photo-1\n",
+        encoding="utf-8",
+    )
+    mapping = {"ID": "Record", "Type": "Kind", "Label": "Caption",
+               "Primary": "Answer", "Secondary": "Extra", "Note": "Comment",
+               "Media": "Files"}
+
+    meta, fields, media, rows = app.load_audit_csv(source, mapping)
+    header_idx = app.find_header_row(source, mapping)
+
+    assert meta == {}
+    assert fields["Building"] == "BLD-42"
+    assert media[0].media_ids == ["photo-1"]
+    assert rows[0].row_id == "1"
+    assert app.read_first_csv_values(source, header_idx)["Answer"] == "BLD-42"
+
+
+def test_explicit_table_range_skips_preamble_and_ignores_trailing_columns(tmp_path):
+    source = tmp_path / "preamble.csv"
+    source.write_text(
+        "Export generated for customer,,,,,,,,\n"
+        "Do not edit,,,,,,,,\n"
+        "Record,Kind,Caption,Answer,Extra,Comment,Files,Unused,\n"
+        "1,text,Building,BLD-42,,,,ignored,\n",
+        encoding="utf-8",
+    )
+    mapping = {"ID": "Record", "Type": "Kind", "Label": "Caption",
+               "Primary": "Answer", "Secondary": "Extra", "Note": "Comment",
+               "Media": "Files"}
+
+    preview = app.read_csv_preview(source)
+    headers = app.inspect_csv_headers(source, header_row=2, column_count=7)
+    _, fields, _, _ = app.load_audit_csv(source, mapping, header_row=2, column_count=7)
+
+    assert len(preview) == 4
+    assert headers == ("Record", "Kind", "Caption", "Answer", "Extra", "Comment", "Files")
+    assert fields["Building"] == "BLD-42"
+
+
 @pytest.mark.parametrize(
     "pattern",
     ["{building_id.__class__}.pdf", "{project_name[0]}.pdf", "{building_id!r}.pdf",
