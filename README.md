@@ -49,4 +49,26 @@ If you prefer to run the script directly with your local Python (instead of a bu
    python3 ssv_zip_processor_gui_v22.py
    ```
 
+To process an export from the command line, pass the input ZIP and output
+directory. You can select a saved export template by its stable ID:
+
+```sh
+python3 ssv_zip_processor_gui_v22.py --list-export-templates
+python3 ssv_zip_processor_gui_v22.py --zip audit.zip --out reports \
+  --export-template werklogger-report-v1
+```
+
+The listing shows both the stable ID accepted by `--export-template` and the
+editable display name. Always use the ID in scripts.
+
 You can still use `run_worklogger.command` on macOS if you already have Python installed; it will install dependencies and launch the GUI.
+
+## Run the test suite
+
+The tests create isolated temporary directories and generate their own CSV, JPEG,
+ZIP, and PDF fixtures, so no sample customer exports are required:
+
+```sh
+python3 -m pip install -r requirements-test.txt
+python3 -m pytest
+```

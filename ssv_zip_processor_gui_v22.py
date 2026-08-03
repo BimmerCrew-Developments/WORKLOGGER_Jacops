@@ -38,7 +38,8 @@ import uuid
 import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional, Set, Tuple
+from string import Formatter
+from typing import Any, Callable, Dict, List, Mapping, Optional, Set, Tuple
 
 # GUI (optional at import time; required for desktop use)
 try:
@@ -113,6 +114,43 @@ class ReportRow:
 
 
 @dataclass(frozen=True)
+class ExportField:
+    """A value that templates are allowed to read from :class:`ReportRow`."""
+
+    display_name: str
+    getter: Callable[[ReportRow], Any]
+
+
+# This is the sole interface between untrusted presentation templates and imported
+# report data.  Keys are stable; Python attribute paths and expressions are never
+# accepted from a template file.
+EXPORT_FIELD_REGISTRY: Mapping[str, ExportField] = {
+    "report_datetime": ExportField("Report date and time", lambda row: row.report_datetime),
+    "subcontractor": ExportField("Subcontractor name", lambda row: row.naam_onderaannemer),
+    "project_name": ExportField("Project/location name", lambda row: row.project_locatie_naam),
+    "building_id": ExportField("Building ID", lambda row: row.building_id),
+    "address": ExportField("Address", lambda row: row.adres),
+    "postal_city": ExportField("Postal code and city", lambda row: row.postcode_stad),
+    "contact": ExportField("Contact person", lambda row: row.contactpersoon),
+    "quadrant": ExportField("Quadrant", lambda row: row.quadrant),
+    "duct_color": ExportField("Connected duct color", lambda row: row.duct_kleur),
+    "units_welded": ExportField("Units welded", lambda row: row.units_gelast),
+    "materials": ExportField("Materials used", lambda row: row.gebruikte_materialen_lines),
+    "post_registrations": ExportField("Post registrations", lambda row: row.post_afmeldingen_lines),
+    "photos": ExportField("Photos", lambda row: row.photos),
+}
+
+SECTION_FIELD_KEYS: Mapping[str, Tuple[str, ...]] = {
+    "address": ("subcontractor", "project_name", "building_id", "address", "postal_city", "contact", "quadrant"),
+    "lmra": (),
+    "work_details": ("duct_color", "units_welded"),
+    "materials": ("materials",),
+    "post_registrations": ("post_registrations",),
+    "photos": ("photos",),
+}
+
+
+@dataclass(frozen=True)
 class ExportTemplate:
     """Declarative PDF export layout.
 
@@ -128,10 +166,41 @@ class ExportTemplate:
     colors: Mapping[str, Tuple[float, float, float]]
     enabled_sections: Tuple[str, ...]
     section_order: Tuple[str, ...]
+    section_fields: Mapping[str, Tuple[str, ...]]
     field_labels: Mapping[str, str]
     photo_grid: Mapping[str, Any]
     output_filename_pattern: str
+    include_photo_pages: bool = True
+    include_loose_images: bool = True
+    include_pdf_attachments: bool = True
+    create_output_zip: bool = True
+    empty_value_fallback: str = "Niet ingevuld"
     layout: Mapping[str, Any] = field(default_factory=dict)
+
+
+# All report copy which is not sourced from the CSV lives here.  Keeping these
+# keys together makes old template documents straightforward to migrate.
+DEFAULT_TEMPLATE_BRANDING: Mapping[str, str] = {
+    "report_title": "WERKLOGGER RAPPORT",
+    "section_address": "Adresgegevens:",
+    "section_lmra": "LMRA Checklist:",
+    "section_work_details": "Uitgevoerde Werken - Details:",
+    "section_materials": "Gebruikte materialen:",
+    "section_post_registrations": "Post Afmeldingen:",
+    "section_continuation_pattern": "{title} (vervolg):",
+    "lmra_status": "LMRA Status: OK - Werk kan worden uitgevoerd",
+    "lmra_item_1": "Veiligheidsrisico's geïdentificeerd",
+    "lmra_item_2": "Juiste PBM aanwezig",
+    "lmra_item_3": "Werknemers geïnformeerd",
+    "lmra_item_4": "Noodprocedures bekend",
+    "lmra_item_5": "Werkgebied afgezet",
+    "lmra_item_6": "Vergunningen aanwezig",
+    "yes_label": "JA",
+    "no_label": "NEE",
+    "photo_title": "Foto's:",
+    "photo_continuation_title": "Foto's (vervolg):",
+}
+REQUIRED_BRANDING_KEYS = frozenset(DEFAULT_TEMPLATE_BRANDING)
 
 
 # This is the compatibility template.  Its values are the measurements and copy
@@ -140,29 +209,31 @@ WERKLOGGER_EXPORT_TEMPLATE = ExportTemplate(
     template_id="werklogger-report-v1",
     display_name="WERKLOGGER RAPPORT",
     page_settings={"pagesize": A4, "bottom_y": 70.0},
-    branding={"report_title": "WERKLOGGER RAPPORT", "photo_title": "Foto's"},
+    branding=DEFAULT_TEMPLATE_BRANDING,
     colors={
         "primary": (0.702, 0.0, 0.0), "secondary": (0.549, 0.427, 0.0),
         "status_bar": (0.83, 0.93, 0.85), "status_yes": (0.2, 0.6, 0.2),
     },
     enabled_sections=("address", "lmra", "work_details", "materials", "post_registrations", "photos"),
     section_order=("address", "lmra", "work_details", "materials", "post_registrations", "photos"),
+    section_fields=SECTION_FIELD_KEYS,
     field_labels={
-        "address": "Adresgegevens:", "subcontractor": "Naam Onderaannemer:",
-        "project": "Project/Locatie Naam:", "building_id": "Building ID:",
-        "street_address": "Adres:", "postal_city": "Postcode + Stad:",
+        "subcontractor": "Naam Onderaannemer:",
+        "project_name": "Project/Locatie Naam:", "building_id": "Building ID:",
+        "address": "Adres:", "postal_city": "Postcode + Stad:",
         "contact": "Contactpersoon:", "quadrant": "Quadrant:",
-        "lmra": "LMRA Checklist:", "work_details": "Uitgevoerde Werken - Details:",
         "duct_color": "Gekoppelde kleur duct:", "units_welded": "Hoeveel units gelast:",
-        "materials": "Gebruikte materialen:", "post_registrations": "Post Afmeldingen:",
     },
     photo_grid={
         "columns": 2, "rows": 3, "left": 56.6929, "right": 538.5827,
-        "column_gap": 28.3464, "box_height": 170.0787, "row_top": 745.5118,
-        "row_step": 198.4252, "label_offset": 12.1102,
-        "heading_y": 782.30, "underline_y": 773.8585,
+        "column_gap": 28.3464, "top_margin": 56.6929,
+        "heading_area": 39.685, "label_allowance": 18.0, "row_gap": 10.0,
     },
     output_filename_pattern="{building_id}-{project_name}-{report_datetime}-RAPPORT.pdf",
+    include_photo_pages=True,
+    include_loose_images=True,
+    include_pdf_attachments=True,
+    create_output_zip=True,
     layout={
         "left": 56.6929, "right": 538.5827, "line_width": 1.4173,
         "banner_y": 771.0236, "banner_height": 42.5197, "title_y": 784.72,
@@ -171,6 +242,303 @@ WERKLOGGER_EXPORT_TEMPLATE = ExportTemplate(
         "line_spacing": 17.0079,
     },
 )
+
+TEMPLATE_SECTIONS = (
+    ("address", "Address"), ("lmra", "LMRA checklist"),
+    ("work_details", "Work details"), ("materials", "Materials"),
+    ("post_registrations", "Post registrations"), ("photos", "Photos"),
+)
+SECTION_BRANDING_KEYS = {
+    "address": "section_address", "lmra": "section_lmra",
+    "work_details": "section_work_details", "materials": "section_materials",
+    "post_registrations": "section_post_registrations",
+}
+FILENAME_PLACEHOLDERS = frozenset({"building_id", "project_name", "report_datetime"})
+
+
+EXPORT_TEMPLATE_CONFIG_VERSION = 1
+
+
+class ExportTemplateConfigurationError(RuntimeError):
+    """An export-template configuration could not be safely read or written."""
+
+    def __init__(self, message: str, recovered_templates: Optional[List[ExportTemplate]] = None) -> None:
+        super().__init__(message)
+        self.recovered_templates = recovered_templates
+
+
+# Photo cells smaller than one inch are not useful in a printed work report.
+# The explicit count limits also keep accidental values from producing enormous
+# documents, even on an unusually large custom page size.
+MIN_PHOTO_WIDTH = 72.0
+MIN_PHOTO_HEIGHT = 72.0
+MAX_PHOTO_COLUMNS = 5
+MAX_PHOTO_ROWS = 6
+
+
+@dataclass(frozen=True)
+class PhotoGridGeometry:
+    """Fully resolved photo geometry, in PDF points."""
+
+    column_boxes: Tuple[Tuple[float, float], ...]
+    row_tops: Tuple[float, ...]
+    box_width: float
+    box_height: float
+    row_step: float
+    heading_y: float
+    underline_y: float
+
+
+def calculate_photo_grid_geometry(page_settings: Mapping[str, Any],
+                                  photo_grid: Mapping[str, Any]) -> PhotoGridGeometry:
+    """Derive photo cells from the printable region instead of fixed A4 rows."""
+    page_width, page_height = (float(value) for value in page_settings["pagesize"])
+    left = float(photo_grid["left"])
+    right = float(photo_grid["right"])
+    bottom = float(page_settings["bottom_y"])
+    top_margin = float(photo_grid.get("top_margin", left))
+    heading_area = float(photo_grid.get("heading_area", 39.685))
+    label_allowance = float(photo_grid.get("label_allowance", 18.0))
+    row_gap = float(photo_grid.get("row_gap", 10.0))
+    column_gap = float(photo_grid["column_gap"])
+    rows, columns = int(photo_grid["rows"]), int(photo_grid["columns"])
+
+    if not 1 <= rows <= MAX_PHOTO_ROWS or not 1 <= columns <= MAX_PHOTO_COLUMNS:
+        raise ValueError(
+            f"Photo grid supports 1-{MAX_PHOTO_ROWS} rows and "
+            f"1-{MAX_PHOTO_COLUMNS} columns."
+        )
+    printable_top = page_height - top_margin
+    images_top = printable_top - heading_area - label_allowance
+    available_image_height = images_top - bottom - row_gap * (rows - 1) - label_allowance * (rows - 1)
+    box_height = available_image_height / rows
+    box_width = (right - left - column_gap * (columns - 1)) / columns
+    if left < 0 or right > page_width or right <= left or bottom < 0 or printable_top > page_height:
+        raise ValueError("Photo margins must define a printable region inside the selected page size.")
+    if heading_area < 0 or label_allowance < 0 or row_gap < 0 or column_gap < 0:
+        raise ValueError("Photo heading, label, and gap allowances cannot be negative.")
+    if box_width < MIN_PHOTO_WIDTH or box_height < MIN_PHOTO_HEIGHT:
+        raise ValueError(
+            "Photo grid does not fit the printable page: each image must be at least "
+            f"{MIN_PHOTO_WIDTH / 72:g} x {MIN_PHOTO_HEIGHT / 72:g} inch including label space."
+        )
+    row_step = box_height + label_allowance + row_gap
+    row_tops = tuple(images_top - index * row_step for index in range(rows))
+    column_boxes = tuple(
+        (left + index * (box_width + column_gap), left + index * (box_width + column_gap) + box_width)
+        for index in range(columns)
+    )
+    return PhotoGridGeometry(
+        column_boxes, row_tops, box_width, box_height, row_step,
+        printable_top - 14.0, printable_top - heading_area + 8.0,
+    )
+
+
+def _adjacent_export_template_path() -> Path:
+    """Return the location used by releases that stored data beside the app."""
+    base = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
+    return base / "export_templates.json"
+
+
+def export_template_config_path() -> Path:
+    """Use the same platform-aware per-user configuration root as projects."""
+    return project_config_path().with_name("export_templates.json")
+
+
+def export_template_to_dict(template: ExportTemplate) -> Dict[str, Any]:
+    """Convert a template to its portable JSON representation."""
+    return {
+        "template_id": template.template_id, "display_name": template.display_name,
+        "page_settings": dict(template.page_settings), "branding": dict(template.branding),
+        "colors": {key: list(value) for key, value in template.colors.items()},
+        "enabled_sections": list(template.enabled_sections), "section_order": list(template.section_order),
+        "section_fields": {key: list(value) for key, value in template.section_fields.items()},
+        "field_labels": dict(template.field_labels), "photo_grid": dict(template.photo_grid),
+        "output_filename_pattern": template.output_filename_pattern,
+        "include_photo_pages": template.include_photo_pages,
+        "include_loose_images": template.include_loose_images,
+        "include_pdf_attachments": template.include_pdf_attachments,
+        "create_output_zip": template.create_output_zip,
+        "empty_value_fallback": template.empty_value_fallback, "layout": dict(template.layout),
+    }
+
+
+def export_template_from_dict(data: Mapping[str, Any]) -> ExportTemplate:
+    """Build and validate a custom template from untrusted JSON data."""
+    # Templates written by earlier releases only have report_title/photo_title.
+    # Defaults are intentionally applied only to absent keys: explicitly blank
+    # required copy remains a validation error rather than being silently fixed.
+    branding = {**DEFAULT_TEMPLATE_BRANDING, **dict(data["branding"])}
+    if branding.get("photo_title") == "Foto's":
+        branding["photo_title"] = DEFAULT_TEMPLATE_BRANDING["photo_title"]
+    template = ExportTemplate(
+        template_id=str(data["template_id"]), display_name=str(data["display_name"]),
+        page_settings=dict(data["page_settings"]), branding=branding,
+        colors={key: tuple(value) for key, value in dict(data["colors"]).items()},
+        enabled_sections=tuple(data["enabled_sections"]), section_order=tuple(data["section_order"]),
+        section_fields={str(k): tuple(v) for k, v in dict(data.get("section_fields", SECTION_FIELD_KEYS)).items()},
+        field_labels={str(k): str(v) for k, v in dict(data["field_labels"]).items()},
+        photo_grid={**WERKLOGGER_EXPORT_TEMPLATE.photo_grid, **dict(data["photo_grid"])},
+        output_filename_pattern=str(data["output_filename_pattern"]),
+        include_photo_pages=bool(data.get("include_photo_pages", True)),
+        include_loose_images=bool(data.get("include_loose_images", True)),
+        include_pdf_attachments=bool(data.get("include_pdf_attachments", True)),
+        create_output_zip=bool(data.get("create_output_zip", True)),
+        empty_value_fallback=str(data.get("empty_value_fallback", "Niet ingevuld")),
+        layout=dict(data["layout"]),
+    )
+    if resolve_export_template(template) is not template:
+        raise ValueError("Invalid export template")
+    return template
+
+
+def validate_template_values(name: str, title: str, pattern: str, colors: Mapping[str, Any],
+                             sections: List[str], rows: Any, columns: Any,
+                             page_settings: Optional[Mapping[str, Any]] = None,
+                             photo_grid: Optional[Mapping[str, Any]] = None) -> List[str]:
+    """Return all user-facing validation errors for editable template values."""
+    errors: List[str] = []
+    if not name.strip(): errors.append("Template name is required.")
+    if not title.strip(): errors.append("Report title is required.")
+    if not pattern.strip(): errors.append("Filename pattern is required.")
+    try:
+        substitute_export_placeholders(pattern, {key: "value" for key in FILENAME_PLACEHOLDERS}, FILENAME_PLACEHOLDERS)
+    except ValueError as exc:
+        errors.append(f"Invalid filename pattern: {exc}")
+    if not sections: errors.append("Enable at least one section.")
+    try:
+        parsed_rows, parsed_columns = int(rows), int(columns)
+        if str(rows).strip() != str(parsed_rows) or str(columns).strip() != str(parsed_columns): raise ValueError
+        candidate_grid = dict(photo_grid or WERKLOGGER_EXPORT_TEMPLATE.photo_grid)
+        candidate_grid.update(rows=parsed_rows, columns=parsed_columns)
+        calculate_photo_grid_geometry(page_settings or WERKLOGGER_EXPORT_TEMPLATE.page_settings, candidate_grid)
+    except (TypeError, ValueError) as exc:
+        errors.append(str(exc) if str(exc).startswith("Photo grid") else
+                      "Photo rows and columns must be positive whole numbers within the printable page.")
+    for key, value in colors.items():
+        if not re.fullmatch(r"#[0-9a-fA-F]{6}", str(value).strip()):
+            errors.append(f"Color {key} must use #RRGGBB format.")
+    return errors
+
+
+def substitute_export_placeholders(pattern: str, values: Mapping[str, str], allowed: Set[str] | frozenset[str]) -> str:
+    """Substitute plain, allow-listed ``{key}`` placeholders only.
+
+    Format specifications, conversions, indexing, and attribute access are
+    deliberately rejected rather than delegated to ``str.format``.
+    """
+    output: List[str] = []
+    try:
+        parsed = Formatter().parse(pattern)
+        for literal, key, format_spec, conversion in parsed:
+            output.append(literal)
+            if key is None:
+                continue
+            if not key or key not in allowed:
+                raise ValueError(f"unknown placeholder: {key or '<empty>'}")
+            if format_spec or conversion:
+                raise ValueError(f"formatting is not allowed for placeholder: {key}")
+            output.append(str(values.get(key, "")))
+    except (KeyError, IndexError, ValueError) as exc:
+        raise ValueError(str(exc)) from exc
+    return "".join(output)
+
+
+def export_field_value(report: ReportRow, key: str, empty_fallback: str = "") -> Any:
+    """Read a registered report field and apply fallback to missing text values."""
+    try:
+        value = EXPORT_FIELD_REGISTRY[key].getter(report)
+    except KeyError as exc:
+        raise ValueError(f"Unknown export field: {key}") from exc
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return empty_fallback
+    return value
+
+
+def _decode_export_template_config(path: Path, *, legacy: bool = False) -> List[ExportTemplate]:
+    """Decode and validate either a current document or the historical bare list."""
+    result = [WERKLOGGER_EXPORT_TEMPLATE]
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if legacy:
+            items = data
+        else:
+            version = data.get("version") if isinstance(data, dict) else None
+            if type(version) is not int or version != EXPORT_TEMPLATE_CONFIG_VERSION:
+                raise ExportTemplateConfigurationError(
+                    f"Unsupported export-template configuration version {version!r} in {path}; "
+                    f"expected {EXPORT_TEMPLATE_CONFIG_VERSION}."
+                )
+            items = data.get("templates")
+        if not isinstance(items, list):
+            raise ExportTemplateConfigurationError(f"Invalid export-template list in {path}.")
+        for item in items:
+            template = export_template_from_dict(item)
+            if template.template_id != WERKLOGGER_EXPORT_TEMPLATE.template_id:
+                result.append(template)
+    except ExportTemplateConfigurationError:
+        raise
+    except (OSError, UnicodeError, ValueError, TypeError, KeyError, json.JSONDecodeError) as exc:
+        raise ExportTemplateConfigurationError(
+            f"Could not read export-template configuration {path}: {exc}"
+        ) from exc
+    return result
+
+
+def load_export_templates(path: Optional[Path] = None) -> List[ExportTemplate]:
+    """Load templates, migrating old storage and recovering a damaged file once."""
+    destination = path or export_template_config_path()
+    if not destination.exists():
+        legacy = _adjacent_export_template_path()
+        if path is None and legacy.exists() and legacy != destination:
+            templates = _decode_export_template_config(legacy, legacy=True)
+            save_export_templates(templates, destination)
+            return templates
+        return [WERKLOGGER_EXPORT_TEMPLATE]
+    try:
+        return _decode_export_template_config(destination)
+    except ExportTemplateConfigurationError as original_error:
+        backup = destination.with_suffix(destination.suffix + ".bak")
+        if not backup.exists():
+            raise
+        try:
+            recovered = _decode_export_template_config(backup)
+            damaged = destination.with_name(f"{destination.name}.damaged-{uuid.uuid4().hex}")
+            os.replace(destination, damaged)
+            _atomic_write(destination, backup.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, ExportTemplateConfigurationError) as recovery_error:
+            raise ExportTemplateConfigurationError(
+                f"{original_error} Backup recovery also failed: {recovery_error}"
+            ) from original_error
+        raise ExportTemplateConfigurationError(
+            f"The damaged export-template configuration was preserved as {damaged}. "
+            f"Templates were recovered from {backup}.",
+            recovered_templates=recovered,
+        ) from original_error
+
+
+def save_export_templates(templates: List[ExportTemplate], path: Optional[Path] = None) -> None:
+    """Atomically persist templates and back up the last valid document."""
+    destination = path or export_template_config_path()
+    invalid = [template.template_id for template in templates if resolve_export_template(template) is not template]
+    if invalid:
+        raise ExportTemplateConfigurationError("Refusing to save invalid template(s): " + ", ".join(invalid))
+    document = {"version": EXPORT_TEMPLATE_CONFIG_VERSION, "templates": [
+        export_template_to_dict(t) for t in templates
+        if t.template_id != WERKLOGGER_EXPORT_TEMPLATE.template_id
+    ]}
+    try:
+        if destination.exists():
+            _decode_export_template_config(destination)
+            _atomic_write(destination.with_suffix(destination.suffix + ".bak"),
+                          destination.read_text(encoding="utf-8"))
+        _atomic_write(destination, json.dumps(document, ensure_ascii=False, indent=2) + "\n")
+    except ExportTemplateConfigurationError:
+        raise
+    except (OSError, UnicodeError) as exc:
+        raise ExportTemplateConfigurationError(
+            f"Could not write export-template configuration {destination}: {exc}"
+        ) from exc
 
 
 def resolve_export_template(template: Optional[ExportTemplate]) -> ExportTemplate:
@@ -187,16 +555,30 @@ def resolve_export_template(template: Optional[ExportTemplate]) -> ExportTemplat
             bool(template.template_id and template.display_name and template.output_filename_pattern)
             and set(template.enabled_sections).issubset(required_sections)
             and len(template.section_order) == len(set(template.section_order))
-            and set(template.enabled_sections) == set(template.section_order)
+            and set(template.enabled_sections).issubset(set(template.section_order))
+            and set(template.section_order).issubset(required_sections)
+            and set(template.section_fields) == required_sections
+            and all(set(keys).issubset(EXPORT_FIELD_REGISTRY) for keys in template.section_fields.values())
+            and all(tuple(template.section_fields[key]) == keys for key, keys in SECTION_FIELD_KEYS.items())
             and bool(template.page_settings.get("pagesize"))
             and "bottom_y" in template.page_settings
             and required_layout.issubset(template.layout)
-            and required_labels.issubset(template.field_labels)
+            and set(template.field_labels) == required_labels
+            and set(template.field_labels).issubset(EXPORT_FIELD_REGISTRY)
             and required_colors.issubset(template.colors)
             and required_grid.issubset(template.photo_grid)
-            and int(template.photo_grid["columns"]) > 0
-            and int(template.photo_grid["rows"]) > 0
+            and REQUIRED_BRANDING_KEYS.issubset(template.branding)
+            and all(isinstance(template.branding[key], str) and template.branding[key].strip()
+                    for key in REQUIRED_BRANDING_KEYS)
+            and "{title}" in template.branding["section_continuation_pattern"]
+            and bool(calculate_photo_grid_geometry(template.page_settings, template.photo_grid))
         )
+        if valid:
+            substitute_export_placeholders(
+                template.output_filename_pattern,
+                {key: "value" for key in FILENAME_PLACEHOLDERS},
+                FILENAME_PLACEHOLDERS,
+            )
     except (AttributeError, TypeError, ValueError):
         valid = False
     return template if valid else WERKLOGGER_EXPORT_TEMPLATE
@@ -209,6 +591,7 @@ class ProcessResult:
     written_images: int
     output_zip_path: Optional[Path] = None
     copied_pdfs: int = 0
+    generated_artifacts: List[Path] = field(default_factory=list)
 
 
 # =========================
@@ -477,109 +860,152 @@ DEFAULT_PROJECTS: list[str] = [
 ]
 
 
-def _project_store_path() -> Path:
-    """Prefer a local projects.json next to the script/exe, fallback to user home."""
+PROJECT_CONFIG_VERSION = 2
+
+
+@dataclass(frozen=True)
+class ProjectRecord:
+    """A persisted project and its preferred export template."""
+
+    project_id: str
+    display_name: str
+    default_template_id: str = WERKLOGGER_EXPORT_TEMPLATE.template_id
+
+
+def _project_record(name: str) -> ProjectRecord:
+    """Convert a historical project name to a stable version-2 record."""
+    name = name.strip()
+    return ProjectRecord(name, name, WERKLOGGER_EXPORT_TEMPLATE.template_id)
+
+
+DEFAULT_PROJECT_RECORDS = tuple(_project_record(name) for name in DEFAULT_PROJECTS)
+
+
+class ProjectConfigurationError(RuntimeError):
+    """A project configuration could not be safely read or written."""
+
+
+def project_config_path() -> Path:
+    """Return the platform-appropriate, per-user project configuration file."""
+    if sys.platform == "win32":
+        root = Path(os.environ.get("APPDATA") or Path.home() / "AppData" / "Roaming")
+        return root / "SSV ZIP Processor" / "projects.json"
+    if sys.platform == "darwin":
+        return Path.home() / "Library" / "Application Support" / "SSV ZIP Processor" / "projects.json"
+    root = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config")
+    return root / "ssv-zip-processor" / "projects.json"
+
+
+def _legacy_project_paths() -> Tuple[Path, Path]:
+    adjacent_base = (Path(sys.executable).resolve().parent if getattr(sys, "frozen", False)
+                     else Path(__file__).resolve().parent)
+    return adjacent_base / "projects.json", Path.home() / ".ssv_zip_processor_projects.json"
+
+
+def _decode_project_config(path: Path, *, legacy: bool = False) -> List[ProjectRecord]:
     try:
-        base = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))  # type: ignore[attr-defined]
-    except Exception:
-        base = Path(__file__).resolve().parent
-    # When frozen, _MEIPASS is temp; store next to executable instead
-    if getattr(sys, "frozen", False):
-        base = Path(sys.executable).resolve().parent  # type: ignore[attr-defined]
-    p = base / "projects.json"
-    return p
-
-
-def _stable_project_id(display_name: str) -> str:
-    """Return the same ID for a project name on every installation."""
-    return "project-" + uuid.uuid5(uuid.NAMESPACE_URL, "ssv-project:" + display_name).hex
-
-
-def _default_project_records() -> List[ProjectRecord]:
-    return [ProjectRecord(_stable_project_id(name), name) for name in DEFAULT_PROJECTS]
-
-
-def _config_to_json(config: AppConfig) -> dict:
-    return {
-        "version": CONFIG_VERSION,
-        "projects": [
-            {
-                "id": project.id,
-                "display_name": project.display_name,
-                "default_template_id": project.default_template_id,
-            }
-            for project in config.projects
-        ],
-        "templates": [
-            {"id": template.id, "display_name": template.display_name}
-            for template in config.templates
-        ],
-    }
-
-
-def load_projects() -> AppConfig:
-    """Load the versioned configuration and migrate the legacy name list."""
-    projects = _default_project_records()
-    templates = list(DEFAULT_TEMPLATES)
-    p = _project_store_path()
-    migrated = False
-    try:
-        if p.exists():
-            data = json.loads(p.read_text(encoding="utf-8"))
-            # v1 was simply a JSON list containing custom project names.
-            if isinstance(data, list):
-                for item in data:
-                    if isinstance(item, str) and item.strip():
-                        name = item.strip()
-                        projects.append(ProjectRecord(_stable_project_id(name), name))
-                migrated = True
-            elif isinstance(data, dict):
-                for item in data.get("projects", []):
-                    if not isinstance(item, dict) or not str(item.get("display_name", "")).strip():
-                        continue
-                    name = str(item["display_name"]).strip()
-                    projects.append(ProjectRecord(
-                        str(item.get("id") or _stable_project_id(name)),
-                        name,
-                        str(item["default_template_id"]) if item.get("default_template_id") else None,
-                    ))
-                loaded_templates = []
-                for item in data.get("templates", []):
-                    if isinstance(item, dict) and item.get("id") and item.get("display_name"):
-                        loaded_templates.append(TemplateRecord(str(item["id"]), str(item["display_name"])))
-                if loaded_templates:
-                    templates = loaded_templates
-    except Exception:
-        # Ignore malformed config; keep defaults
-        pass
-    # Deduplicate by ID while preserving order. User records replace bundled ones,
-    # which lets a saved default template augment a bundled project.
-    by_id = {project.id: project for project in projects}
-    out: List[ProjectRecord] = []
-    seen = set()
-    for project in projects:
-        if project.id not in seen:
-            out.append(by_id[project.id])
-            seen.add(project.id)
-    config = AppConfig(CONFIG_VERSION, out, templates)
-    if migrated:
-        save_projects(config)
-    return config
-
-
-def save_projects(config: AppConfig) -> None:
-    """Save project and export-template records as a versioned document."""
-    p = _project_store_path()
-    contents = json.dumps(_config_to_json(config), ensure_ascii=False, indent=2)
-    try:
-        p.write_text(contents, encoding="utf-8")
-    except Exception:
-        # If we can't write next to exe/script (permissions), fallback to user home
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ProjectConfigurationError(f"Could not read project configuration {path}: {exc}") from exc
+    version = 1 if legacy else data.get("version") if isinstance(data, dict) else None
+    if legacy:
+        projects = data
+    else:
+        if (not isinstance(data, dict) or type(data.get("version")) is not int
+                or data.get("version") not in (1, PROJECT_CONFIG_VERSION)):
+            raise ProjectConfigurationError(
+                f"Unsupported project configuration version {version!r} in {path}; "
+                f"expected {PROJECT_CONFIG_VERSION}."
+            )
+        projects = data.get("projects")
+    if not isinstance(projects, list):
+        raise ProjectConfigurationError(f"Invalid project list in {path}.")
+    if version == 1:
+        if any(not isinstance(item, str) for item in projects):
+            raise ProjectConfigurationError(f"Invalid version-1 project list in {path}.")
+        return [_project_record(item) for item in projects if item.strip()]
+    records: List[ProjectRecord] = []
+    for item in projects:
+        if (not isinstance(item, dict)
+                or any(not isinstance(item.get(key), str)
+                       for key in ("project_id", "display_name", "default_template_id"))):
+            raise ProjectConfigurationError(f"Invalid project record in {path}.")
         try:
-            home_p = Path.home() / ".ssv_zip_processor_projects.json"
-            home_p.write_text(contents, encoding="utf-8")
-        except Exception:
-            pass
+            record = ProjectRecord(
+                project_id=str(item["project_id"]).strip(),
+                display_name=str(item["display_name"]).strip(),
+                default_template_id=str(item["default_template_id"]).strip(),
+            )
+        except (KeyError, TypeError) as exc:
+            raise ProjectConfigurationError(f"Invalid project record in {path}.") from exc
+        if not record.project_id or not record.display_name or not record.default_template_id:
+            raise ProjectConfigurationError(f"Invalid project record in {path}.")
+        records.append(record)
+    return records
+
+
+def _atomic_write(path: Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path: Optional[Path] = None
+    try:
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=path.parent,
+                                         prefix=f".{path.name}.", suffix=".tmp", delete=False) as handle:
+            temp_path = Path(handle.name)
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, path)
+    finally:
+        if temp_path is not None:
+            temp_path.unlink(missing_ok=True)
+
+
+def save_projects(projects: List[ProjectRecord]) -> None:
+    """Atomically save project records and back up the last valid configuration."""
+    unique = list({project.project_id: project for project in projects}.values())
+    path = project_config_path()
+    try:
+        if path.exists():
+            _decode_project_config(path)  # Never replace an invalid file or call it a valid backup.
+            _atomic_write(path.with_suffix(path.suffix + ".bak"), path.read_text(encoding="utf-8"))
+        document = {"version": PROJECT_CONFIG_VERSION, "projects": [
+            {"project_id": project.project_id, "display_name": project.display_name,
+             "default_template_id": project.default_template_id}
+            for project in unique
+        ]}
+        _atomic_write(path, json.dumps(document, ensure_ascii=False, indent=2) + "\n")
+    except (OSError, UnicodeError, ProjectConfigurationError) as exc:
+        if isinstance(exc, ProjectConfigurationError):
+            raise
+        raise ProjectConfigurationError(f"Could not write project configuration {path}: {exc}") from exc
+
+
+def load_projects() -> List[ProjectRecord]:
+    """Load the versioned configuration, migrating both historical locations once."""
+    path = project_config_path()
+    custom: List[ProjectRecord] = []
+    if path.exists():
+        custom = _decode_project_config(path)
+        # Reading a v1 document is also its in-place, lossless migration.
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        if raw.get("version") == 1:
+            save_projects([*DEFAULT_PROJECT_RECORDS, *custom])
+    else:
+        legacy_found = False
+        for legacy_path in dict.fromkeys(_legacy_project_paths()):
+            if legacy_path.exists():
+                legacy_found = True
+                custom.extend(_decode_project_config(legacy_path, legacy=True))
+        if legacy_found:
+            save_projects(custom)
+
+    return list({project.project_id: project for project in [*DEFAULT_PROJECT_RECORDS, *custom]}.values())
+
+
+def project_default_template(project: ProjectRecord, templates: List[ExportTemplate]) -> ExportTemplate:
+    """Resolve a project's default, safely falling back when it was deleted."""
+    return next((template for template in templates
+                 if template.template_id == project.default_template_id), WERKLOGGER_EXPORT_TEMPLATE)
 
 
 # =========================
@@ -1062,268 +1488,207 @@ def _draw_kv_lines(c: Canvas, x_label: float, x_val: float, y: float, items: Lis
     return y
 
 
-def render_page1(c: Canvas, report: ReportRow, template: Optional[ExportTemplate] = None) -> None:
-    """
-    Render the first report page to match the reference PDF layout (A4).
+@dataclass
+class _Page1RenderContext:
+    """Shared drawing state used by the ordered page-one section renderers."""
 
-    Notes:
-    - Uses fixed coordinates derived from the reference PDF.
-    - Designed to match visually; if lists grow beyond the reserved space, they will be clipped.
-      (Photos always start on the next page.)
-    """
-    template = resolve_export_template(template)
-    w, h = template.page_settings["pagesize"]
-    layout = template.layout
-    labels = template.field_labels
-    X_LEFT, X_RIGHT = layout["left"], layout["right"]
-    RED, GOLD = template.colors["primary"], template.colors["secondary"]
-    GREEN_BAR, YES_GREEN = template.colors["status_bar"], template.colors["status_yes"]
-    LINE_W = layout["line_width"]
+    canvas: Canvas
+    report: ReportRow
+    template: ExportTemplate
+    page_number: int = 1
 
-    # Header banner
-    banner_y0 = layout["banner_y"]
-    banner_h = layout["banner_height"]
-    c.setFillColorRGB(*RED)
-    c.rect(0, banner_y0, w, banner_h, stroke=0, fill=1)
+    def value(self, key: str) -> Any:
+        return export_field_value(self.report, key, self.template.empty_value_fallback)
 
-    # Title (black) + datetime (white, right-aligned)
-    c.setFillColorRGB(0, 0, 0)
-    c.setFont("Helvetica-Bold", 16)
-    c.drawString(X_LEFT, layout["title_y"], template.branding["report_title"])
+    @property
+    def top_y(self) -> float:
+        return 739.78
 
-    c.setFillColorRGB(1, 1, 1)
-    c.setFont("Helvetica-Bold", 10)
-    c.drawRightString(X_RIGHT, layout["datetime_y"], report.report_datetime)
-
-    dy = layout["line_spacing"]
-
-    # Helper: section title + underline
-    def draw_section(title: str, y_title: float, line_y: float, color: Tuple[float, float, float]) -> None:
-        c.setFillColorRGB(*color)
-        c.setFont("Helvetica", 14)
-        c.drawString(X_LEFT, y_title, title)
-        c.setStrokeColorRGB(*color)
-        c.setLineWidth(LINE_W)
-        c.line(X_LEFT, line_y, X_RIGHT, line_y)
-        c.setFillColorRGB(0, 0, 0)
-
-    if "address" in template.enabled_sections:
-        # ======================
-        # Adresgegevens
-        # ======================
-        draw_section(labels["address"], y_title=739.78, line_y=731.34, color=RED)
-
-        addr_x_val = layout["address_value_x"]
-        y = 715.0956
-
-        addr_items = [
-            (labels["subcontractor"], report.naam_onderaannemer),
-            (labels["project"], report.project_locatie_naam),
-            (labels["building_id"], report.building_id),
-            (labels["street_address"], report.adres),
-            (labels["postal_city"], report.postcode_stad),
-            (labels["contact"], report.contactpersoon),
-            (labels["quadrant"], report.quadrant),
-        ]
-
-        for k, v in addr_items:
-            c.setFont("Helvetica-Bold", 10)
-            c.drawString(X_LEFT, y, k)
-            c.setFont("Helvetica", 10)
-            c.drawString(addr_x_val, y, v or "")
-            y -= dy
-
-    if "lmra" in template.enabled_sections:
-        # ======================
-        # LMRA Checklist
-        # ======================
-        draw_section(labels["lmra"], y_title=581.04, line_y=572.60, color=RED)
-
-        # Status bar
-        bar_y0 = 538.5827
-        bar_h = 19.8425
-        c.setFillColorRGB(*GREEN_BAR)
-        c.rect(X_LEFT, bar_y0, X_RIGHT - X_LEFT, bar_h, stroke=0, fill=1)
-
-        c.setFillColorRGB(0, 0, 0)
-        c.setFont("Helvetica", 11)
-        c.drawCentredString((X_LEFT + X_RIGHT) / 2.0, bar_y0 + 5.0, "LMRA Status: OK - Werk kan worden uitgevoerd")
-
-        # Checklist rows
-        checklist_x_yes = layout["checklist_yes_x"]
-        checklist_items = [
-            "Veiligheidsrisico's geïdentificeerd",
-            "Juiste PBM aanwezig",
-            "Werknemers geïnformeerd",
-            "Noodprocedures bekend",
-            "Werkgebied afgezet",
-            "Vergunningen aanwezig",
-        ]
-        y = 522.3386
-        for item in checklist_items:
-            c.setFillColorRGB(0, 0, 0)
-            c.setFont("Helvetica-Bold", 10)
-            c.drawString(X_LEFT, y, item)
-
-            c.setFillColorRGB(*YES_GREEN)
-            c.setFont("Helvetica-Bold", 10)
-            c.drawString(checklist_x_yes, y, "JA")
-            y -= dy
-
-        c.setFillColorRGB(0, 0, 0)
-
-    if "work_details" in template.enabled_sections:
-        # ======================
-        # Uitgevoerde Werken - Details
-        # ======================
-        draw_section(labels["work_details"], y_title=405.29, line_y=396.85, color=RED)
-
-        details_x_val = layout["details_value_x"]
-        y = 380.6142
-        details_items = [
-            (labels["duct_color"], report.duct_kleur),
-            (labels["units_welded"], report.units_gelast),
-        ]
-        for k, v in details_items:
-            c.setFont("Helvetica-Bold", 10)
-            c.drawString(X_LEFT, y, k)
-            c.setFont("Helvetica", 10)
-            c.drawString(details_x_val, y, v or "")
-            y -= dy
-    # ======================
-    # Gebruikte materialen + Post Afmeldingen (paginated)
-    # ======================
-
-    bullet_x = X_LEFT
-    text_x = 62.97
-    c.setFont("Helvetica", 10)
-    c.setFillColorRGB(0, 0, 0)
-
-    TITLE_TO_LINE = 8.45
-    TITLE_TO_TEXT = 24.6898
-    BOTTOM_Y = template.page_settings["bottom_y"]
-    GAP_AFTER_SECTION = 14.0
-
-    def draw_header_only() -> None:
-        # Header banner
-        c.setFillColorRGB(*RED)
-        c.rect(0, banner_y0, w, banner_h, stroke=0, fill=1)
+    def draw_header(self, continuation: bool = False) -> None:
+        c, layout = self.canvas, self.template.layout
+        width, _ = self.template.page_settings["pagesize"]
+        red = self.template.colors["primary"]
+        c.setFillColorRGB(*red)
+        c.rect(0, layout["banner_y"], width, layout["banner_height"], stroke=0, fill=1)
         c.setFillColorRGB(1, 1, 1)
         c.setFont("Helvetica-Bold", 16)
-        c.drawString(X_LEFT, layout["title_y"], template.branding["report_title"])
+        c.drawString(layout["left"], layout["title_y"], self.template.branding["report_title"])
         c.setFont("Helvetica-Bold", 10)
-        c.drawRightString(X_RIGHT, layout["datetime_y"], report.report_datetime)
+        c.drawRightString(layout["right"], layout["datetime_y"], self.value("report_datetime"))
+        if not continuation:
+            # The compatibility layout has a black report title on its first page.
+            c.setFillColorRGB(0, 0, 0)
+            c.setFont("Helvetica-Bold", 16)
+            c.drawString(layout["left"], layout["title_y"], self.template.branding["report_title"])
         c.setFillColorRGB(0, 0, 0)
 
-    def draw_bullet_lines(lines: list[str], y_start: float) -> tuple[list[str], float]:
-        """Draw bullets until we hit BOTTOM_Y. Keeps each bullet together (no split mid-bullet)."""
-        y = y_start
-        remaining: list[str] = []
-        for i, line in enumerate(lines):
-            wrapped = _wrap_lines(line, 110) or ["-"]
-            needed = max(1, len(wrapped))
-            if y - dy * (needed - 1) < BOTTOM_Y:
-                remaining = lines[i:]
+    def new_page(self) -> float:
+        self.canvas.showPage()
+        self.page_number += 1
+        self.draw_header(continuation=True)
+        return self.top_y
+
+    def draw_section_title(self, title: str, y: float, color: Tuple[float, float, float]) -> None:
+        c, layout = self.canvas, self.template.layout
+        c.setFillColorRGB(*color)
+        c.setFont("Helvetica", 14)
+        c.drawString(layout["left"], y, title)
+        c.setStrokeColorRGB(*color)
+        c.setLineWidth(layout["line_width"])
+        c.line(layout["left"], y - 8.45, layout["right"], y - 8.45)
+        c.setFillColorRGB(0, 0, 0)
+
+    def ensure_space(self, y: float, required_height: float) -> float:
+        if y - required_height < self.template.page_settings["bottom_y"]:
+            return self.new_page()
+        return y
+
+
+def _render_address_section(ctx: _Page1RenderContext, y: float) -> float:
+    y = ctx.ensure_space(y, 145.0)
+    ctx.draw_section_title(ctx.template.branding["section_address"], y, ctx.template.colors["primary"])
+    row_y = y - 24.6844
+    for key in ctx.template.section_fields["address"]:
+        ctx.canvas.setFont("Helvetica-Bold", 10)
+        ctx.canvas.drawString(ctx.template.layout["left"], row_y, ctx.template.field_labels[key])
+        ctx.canvas.setFont("Helvetica", 10)
+        ctx.canvas.drawString(ctx.template.layout["address_value_x"], row_y, ctx.value(key) or "")
+        row_y -= ctx.template.layout["line_spacing"]
+    return y - 158.74
+
+
+def _render_lmra_section(ctx: _Page1RenderContext, y: float) -> float:
+    y = ctx.ensure_space(y, 165.0)
+    c, layout = ctx.canvas, ctx.template.layout
+    ctx.draw_section_title(ctx.template.branding["section_lmra"], y, ctx.template.colors["primary"])
+    bar_y = y - 42.4573
+    c.setFillColorRGB(*ctx.template.colors["status_bar"])
+    c.rect(layout["left"], bar_y, layout["right"] - layout["left"], 19.8425, stroke=0, fill=1)
+    c.setFillColorRGB(0, 0, 0)
+    c.setFont("Helvetica", 11)
+    c.drawCentredString((layout["left"] + layout["right"]) / 2.0, bar_y + 5.0,
+                        ctx.template.branding["lmra_status"])
+    row_y = y - 58.7014
+    for item in (ctx.template.branding[f"lmra_item_{index}"] for index in range(1, 7)):
+        c.setFillColorRGB(0, 0, 0)
+        c.setFont("Helvetica-Bold", 10)
+        c.drawString(layout["left"], row_y, item)
+        c.setFillColorRGB(*ctx.template.colors["status_yes"])
+        c.drawString(layout["checklist_yes_x"], row_y, ctx.template.branding["yes_label"])
+        row_y -= layout["line_spacing"]
+    c.setFillColorRGB(0, 0, 0)
+    return y - 175.75
+
+
+def _render_work_details_section(ctx: _Page1RenderContext, y: float) -> float:
+    y = ctx.ensure_space(y, 65.0)
+    ctx.draw_section_title(ctx.template.branding["section_work_details"], y, ctx.template.colors["primary"])
+    row_y = y - 24.6758
+    for key in ctx.template.section_fields["work_details"]:
+        ctx.canvas.setFont("Helvetica-Bold", 10)
+        ctx.canvas.drawString(ctx.template.layout["left"], row_y, ctx.template.field_labels[key])
+        ctx.canvas.setFont("Helvetica", 10)
+        ctx.canvas.drawString(ctx.template.layout["details_value_x"], row_y, ctx.value(key) or "")
+        row_y -= ctx.template.layout["line_spacing"]
+    return y - 70.86
+
+
+def _render_bullet_section(ctx: _Page1RenderContext, y: float, section: str) -> float:
+    raw = ctx.value(ctx.template.section_fields[section][0])
+    lines = list(raw if isinstance(raw, list) else [raw])
+    title = ctx.template.branding[SECTION_BRANDING_KEYS[section]]
+    dy = ctx.template.layout["line_spacing"]
+    while True:
+        y = ctx.ensure_space(y, 24.6898 + dy)
+        ctx.draw_section_title(title, y, ctx.template.colors["secondary"])
+        text_y = y - 24.6898
+        remaining: List[str] = []
+        for index, line in enumerate(lines):
+            wrapped = _wrap_lines(str(line), 110) or ["-"]
+            if text_y - dy * (len(wrapped) - 1) < ctx.template.page_settings["bottom_y"]:
+                remaining = lines[index:]
                 break
-            # bullet line
-            c.drawString(bullet_x, y, u"\u2022")
-            c.drawString(text_x, y, wrapped[0])
-            y -= dy
-            for cont in wrapped[1:]:
-                c.drawString(text_x, y, cont)
-                y -= dy
-        return remaining, y
+            ctx.canvas.setFont("Helvetica", 10)
+            ctx.canvas.drawString(ctx.template.layout["left"], text_y, u"\u2022")
+            ctx.canvas.drawString(62.97, text_y, wrapped[0])
+            text_y -= dy
+            for continuation in wrapped[1:]:
+                ctx.canvas.drawString(62.97, text_y, continuation)
+                text_y -= dy
+        if not remaining:
+            return text_y - 14.0
+        y = ctx.new_page()
+        title = ctx.template.branding["section_continuation_pattern"].replace(
+            "{title}", ctx.template.branding[SECTION_BRANDING_KEYS[section]].rstrip(":"))
+        lines = remaining
 
-    # Render materials across pages if needed
-    mat_lines = list(report.gebruikte_materialen_lines or ["-"])
-    work_lines = list(report.post_afmeldingen_lines or ["-"])
 
-    on_first_page = True
-    mat_title = labels["materials"]
-    mat_y_title = 334.43
-    mat_y_text = 309.7402
+def _render_materials_section(ctx: _Page1RenderContext, y: float) -> float:
+    return _render_bullet_section(ctx, y, "materials")
 
-    while True:
-        if "materials" in template.enabled_sections:
-            draw_section(mat_title, y_title=mat_y_title, line_y=mat_y_title - TITLE_TO_LINE, color=GOLD)
-            c.setFont("Helvetica", 10)
-            mat_remaining, y_after_mat = draw_bullet_lines(mat_lines, mat_y_text)
-        else:
-            mat_remaining, y_after_mat = [], 358.0
-        if not mat_remaining:
-            break
-        # continue on a new page
-        c.showPage()
-        on_first_page = False
-        draw_header_only()
-        mat_title = "Gebruikte materialen (vervolg):"
-        mat_y_title = 760.0
-        mat_y_text = mat_y_title - TITLE_TO_TEXT
-        mat_lines = mat_remaining
 
-    # Render work/post sections; start below materials if needed
-    post_title = labels["post_registrations"]
-    fixed_post_y_title = 244.09
+def _render_post_registrations_section(ctx: _Page1RenderContext, y: float) -> float:
+    return _render_bullet_section(ctx, y, "post_registrations")
 
-    def ensure_space_for_section(y_title: float) -> bool:
-        # True if we can draw at least one bullet line on this page
-        return (y_title - TITLE_TO_TEXT) >= (BOTTOM_Y + dy)
 
-    # Determine starting title position
-    if on_first_page and y_after_mat > (fixed_post_y_title + 30.0):
-        post_y_title = fixed_post_y_title
-    else:
-        post_y_title = y_after_mat - GAP_AFTER_SECTION
+PAGE1_SECTION_RENDERERS: Mapping[str, Callable[[_Page1RenderContext, float], float]] = {
+    "address": _render_address_section,
+    "lmra": _render_lmra_section,
+    "work_details": _render_work_details_section,
+    "materials": _render_materials_section,
+    "post_registrations": _render_post_registrations_section,
+}
 
-    if not ensure_space_for_section(post_y_title):
-        c.showPage()
-        on_first_page = False
-        draw_header_only()
-        post_y_title = 725.0
 
-    post_y_text = post_y_title - TITLE_TO_TEXT
-    post_lines = work_lines
+def render_page1(c: Canvas, report: ReportRow, template: Optional[ExportTemplate] = None) -> None:
+    """
+    Render enabled non-photo sections in the order declared by the template.
 
-    while True:
-        if "post_registrations" in template.enabled_sections:
-            draw_section(post_title, y_title=post_y_title, line_y=post_y_title - TITLE_TO_LINE, color=GOLD)
-            c.setFont("Helvetica", 10)
-            post_remaining, y_after_post = draw_bullet_lines(post_lines, post_y_text)
-        else:
-            post_remaining, y_after_post = [], post_y_text
-        if not post_remaining:
-            break
-        c.showPage()
-        on_first_page = False
-        draw_header_only()
-        post_title = "Post Afmeldingen (vervolg):"
-        post_y_title = 725.0
-        post_y_text = post_y_title - TITLE_TO_TEXT
-        post_lines = post_remaining
+    The built-in template retains its historic fixed section coordinates.  Custom
+    templates use the returned vertical position from each renderer, so reordering
+    ``section_order`` also reorders the visible PDF content.
+    """
+    template = resolve_export_template(template)
+    ctx = _Page1RenderContext(c, report, template)
+    ctx.draw_header()
+    enabled = set(template.enabled_sections)
+    ordered_sections = [name for name in template.section_order
+                        if name in enabled and name in PAGE1_SECTION_RENDERERS]
+    compatibility_layout = template is WERKLOGGER_EXPORT_TEMPLATE
+    compatibility_y = {
+        "address": 739.78, "lmra": 581.04, "work_details": 405.29,
+        "materials": 334.43, "post_registrations": 244.09,
+    }
+    y = ctx.top_y
+    for section in ordered_sections:
+        # Fixed anchors are intentionally limited to the built-in template.  A
+        # custom template always consumes the preceding renderer's position.
+        if compatibility_layout and ctx.page_number == 1:
+            y = compatibility_y[section]
+        y = PAGE1_SECTION_RENDERERS[section](ctx, y)
 
 
 
 def render_photos_pages(c: Canvas, report: ReportRow, template: Optional[ExportTemplate] = None) -> None:
-    """Render photo pages matching the reference layout (2 columns, 3 rows per page)."""
+    """Render photo pages using geometry derived from the template and page."""
     template = resolve_export_template(template)
     w, h = template.page_settings["pagesize"]
     grid, layout = template.photo_grid, template.layout
     X_LEFT, X_RIGHT = grid["left"], grid["right"]
     RED, LINE_W = template.colors["primary"], layout["line_width"]
-    heading_y, underline_y = grid["heading_y"], grid["underline_y"]
+    geometry = calculate_photo_grid_geometry(template.page_settings, grid)
+    heading_y, underline_y = geometry.heading_y, geometry.underline_y
     columns = int(grid["columns"])
-    gap = grid["column_gap"]
-    box_w = (X_RIGHT - X_LEFT - gap * (columns - 1)) / columns
-    column_boxes = [(X_LEFT + i * (box_w + gap), X_LEFT + i * (box_w + gap) + box_w) for i in range(columns)]
-    box_h = grid["box_height"]
-    row_top_start, row_step = grid["row_top"], grid["row_step"]
-    label_offset = grid["label_offset"]
+    box_w, column_boxes = geometry.box_width, geometry.column_boxes
+    box_h = geometry.box_height
+    label_allowance = float(grid.get("label_allowance", 18.0))
     rows_per_page = int(grid["rows"])
 
     def draw_page_heading(first: bool) -> None:
         c.setFillColorRGB(*RED)
         c.setFont("Helvetica", 14)
-        c.drawString(X_LEFT, heading_y, f"{template.branding['photo_title']}:" if first else f"{template.branding['photo_title']} (vervolg):")
+        key = "photo_title" if first else "photo_continuation_title"
+        c.drawString(X_LEFT, heading_y, template.branding[key])
         c.setStrokeColorRGB(*RED)
         c.setLineWidth(LINE_W)
         c.line(X_LEFT, underline_y, X_RIGHT, underline_y)
@@ -1333,7 +1698,8 @@ def render_photos_pages(c: Canvas, report: ReportRow, template: Optional[ExportT
     groups: List[Tuple[str, List[Photo]]] = []
     seen_order: List[str] = []
     by_label: Dict[str, List[Photo]] = {}
-    for p in (report.photos or []):
+    registered_photos = export_field_value(report, template.section_fields["photos"][0], [])
+    for p in registered_photos:
         lbl = p.label or "UNLABELED"
         if lbl not in by_label:
             by_label[lbl] = []
@@ -1346,7 +1712,7 @@ def render_photos_pages(c: Canvas, report: ReportRow, template: Optional[ExportT
     draw_page_heading(first_page)
     first_page = False
 
-    row_index = 0  # 0..2 (3 rows)
+    row_index = 0
 
     def ensure_row_available() -> None:
         nonlocal row_index, first_page
@@ -1366,9 +1732,9 @@ def render_photos_pages(c: Canvas, report: ReportRow, template: Optional[ExportT
         while remaining:
             ensure_row_available()
 
-            row_top = row_top_start - (row_index * row_step)
+            row_top = geometry.row_tops[row_index]
             row_bottom = row_top - box_h
-            label_y = row_top + label_offset
+            label_y = row_top + label_allowance * 0.35
 
             # Print label once at the first row for the group on this page.
             if not label_printed_on_this_page:
@@ -1415,11 +1781,22 @@ def render_photos_pages(c: Canvas, report: ReportRow, template: Optional[ExportT
 
 
 def create_output_zip(out_zip_path: Path, files: List[Tuple[Path, str]]) -> None:
-    """Create a zip at out_zip_path containing the given files (src_path, arcname)."""
+    """Create an output ZIP without silently replacing files or archive members."""
     if out_zip_path.exists():
-        out_zip_path.unlink()
+        raise FileExistsError(f"Output file already exists: {out_zip_path}")
+    safe_files: List[Tuple[Path, str]] = []
+    seen: Set[str] = set()
+    for src, arcname in files:
+        sanitized = safe_filename(Path(arcname).name)
+        key = sanitized.casefold()
+        if key in seen:
+            raise FileExistsError(f"Duplicate output ZIP member: {sanitized}")
+        if not src.is_file():
+            raise FileNotFoundError(f"ZIP input does not exist: {src}")
+        seen.add(key)
+        safe_files.append((src, sanitized))
     with zipfile.ZipFile(out_zip_path, "w", compression=zipfile.ZIP_DEFLATED) as z:
-        for src, arcname in files:
+        for src, arcname in safe_files:
             z.write(src, arcname)
 
 
@@ -1430,7 +1807,7 @@ def build_pdf(out_pdf_path: Path, report: ReportRow, template: Optional[ExportTe
     non_photo_sections = [s for s in template.section_order if s != "photos" and s in template.enabled_sections]
     if non_photo_sections:
         render_page1(c, report, template)
-    if "photos" in template.enabled_sections and report.photos:
+    if template.include_photo_pages and "photos" in template.enabled_sections and report.photos:
         if non_photo_sections:
             c.showPage()
         render_photos_pages(c, report, template)
@@ -1483,11 +1860,11 @@ def process_zip_to_folder_and_pdf(zip_path: Path, out_dir: Path, project_overrid
             report_datetime=dt_str,
             # Always force subcontractor name (requested)
             naam_onderaannemer="F.A.S.T. Support BV.",
-            project_locatie_naam=(project_override.strip() if project_override and project_override.strip() else (fields.get("Project/Locatie Naam", "").strip() or "Niet ingevuld")),
-            building_id=fields.get("Building ID", "").strip() or "Niet ingevuld",
-            adres=sanitize_address(fields.get("Adres", "").strip()) or "Niet ingevuld",
-            postcode_stad=(fields.get("Postcode + Stad", "") or "").replace("+", " ").strip() or "Niet ingevuld",
-            contactpersoon=fields.get("Contactpersoon", "").strip() or "Niet ingevuld",
+            project_locatie_naam=(project_override.strip() if project_override and project_override.strip() else fields.get("Project/Locatie Naam", "").strip()),
+            building_id=fields.get("Building ID", "").strip(),
+            adres=sanitize_address(fields.get("Adres", "").strip()),
+            postcode_stad=(fields.get("Postcode + Stad", "") or "").replace("+", " ").strip(),
+            contactpersoon=fields.get("Contactpersoon", "").strip(),
             quadrant=fields.get("Quadrant", "").strip() or "",
             duct_kleur=fields.get("Gekoppelde kleur subduct", "").strip() or fields.get("Gekoppelde kleur duct", "").strip() or "",
             units_gelast=fields.get("Hoeveel units gelast?", "").strip() or fields.get("Hoeveel units gelast", "").strip() or "",
@@ -1504,28 +1881,15 @@ def process_zip_to_folder_and_pdf(zip_path: Path, out_dir: Path, project_overrid
                 img_by_stem[p.stem.lower()] = p
         nonimg_stems: Set[str] = {p.stem.lower() for p in all_files if p.is_file() and p.suffix.lower() not in {'.jpeg','.jpg'}}
 
-        # Copy any PDF attachments from the input ZIP to output folder (unchanged)
-        pdf_attachments: List[Path] = []
-        for p in all_files:
-            if p.is_file() and p.suffix.lower() == ".pdf":
-                dest = out_dir / p.name
-                try:
-                    shutil.copy2(p, dest)
-                    pdf_attachments.append(dest)
-                except Exception:
-                    pass
-        if pdf_attachments:
-            _log(f"Copied {len(pdf_attachments)} PDF attachment(s).")
+        template = resolve_export_template(template)
 
-
-        # Process images
-        written = 0
+        # Plan every output before writing anything, so collisions never cause a
+        # partially overwritten export. Image discovery itself is unchanged.
         used_names: Set[str] = set()
-        processed_photos: List[Photo] = []
+        planned_images: List[Tuple[Path, str, str]] = []
 
-        _log("Processing images...")
         for mrow in media_rows:
-            base_label = normalize_label(mrow.label)
+            base_label = safe_filename(normalize_label(mrow.label))
             for idx, mid in enumerate(mrow.media_ids, start=1):
                 src = img_by_stem.get(mid.lower())
                 if not src:
@@ -1536,65 +1900,315 @@ def process_zip_to_folder_and_pdf(zip_path: Path, out_dir: Path, project_overrid
                     continue
 
                 out_base = base_label if len(mrow.media_ids) == 1 else f"{base_label}_{idx}"
-                out_name = f"{out_base}.jpeg"
+                out_name = safe_filename(f"{out_base}.jpeg")
                 if out_name.lower() in used_names:
                     n = 2
-                    while f"{out_base}_{n}.jpeg".lower() in used_names:
+                    while safe_filename(f"{out_base}_{n}.jpeg").lower() in used_names:
                         n += 1
-                    out_name = f"{out_base}_{n}.jpeg"
+                    out_name = safe_filename(f"{out_base}_{n}.jpeg")
                 used_names.add(out_name.lower())
+                planned_images.append((src, out_name, mrow.label))
 
-                out_path = out_dir / out_name
-                shutil.copy2(src, out_path)
-                written += 1
-                processed_photos.append(Photo(label=mrow.label, image_path=out_path))
-
-        report.photos = processed_photos
+        planned_attachments: List[Tuple[Path, Path]] = []
+        if template.include_pdf_attachments:
+            for source in all_files:
+                if source.is_file() and source.suffix.lower() == ".pdf":
+                    planned_attachments.append((source, out_dir / safe_filename(source.name)))
 
         # Output naming is presentation configuration; CSV parsing remains template-independent.
-        template = resolve_export_template(template)
-        try:
-            fn = template.output_filename_pattern.format(
-                building_id=safe_filename(report.building_id),
-                project_name=safe_filename(report.project_locatie_naam),
-                report_datetime=safe_filename(report.report_datetime),
-            )
-            fn = safe_filename(Path(fn).stem) + ".pdf"
-        except (KeyError, ValueError, IndexError):
-            template = WERKLOGGER_EXPORT_TEMPLATE
-            fn = template.output_filename_pattern.format(
-                building_id=safe_filename(report.building_id),
-                project_name=safe_filename(report.project_locatie_naam),
-                report_datetime=safe_filename(report.report_datetime),
-            )
+        filename_values = {
+            key: safe_filename(str(export_field_value(report, key, template.empty_value_fallback)))
+            for key in FILENAME_PLACEHOLDERS
+        }
+        fn = substitute_export_placeholders(
+            template.output_filename_pattern, filename_values, FILENAME_PLACEHOLDERS
+        )
+        fn = safe_filename(Path(fn).stem) + ".pdf"
         pdf_path = out_dir / fn
+        out_zip_path: Optional[Path] = None
+        if template.create_output_zip:
+            out_zip_path = out_dir / (safe_filename(Path(fn).stem) + "-OUTPUT.zip")
+
+        loose_image_paths = [out_dir / name for _source, name, _label in planned_images]
+        planned_outputs = [pdf_path]
+        if template.include_loose_images:
+            planned_outputs.extend(loose_image_paths)
+        planned_outputs.extend(destination for _source, destination in planned_attachments)
+        if out_zip_path is not None:
+            planned_outputs.append(out_zip_path)
+        seen_outputs: Dict[str, Path] = {}
+        for destination in planned_outputs:
+            key = destination.name.casefold()
+            if key in seen_outputs:
+                raise FileExistsError(
+                    f"Output filename collision: {seen_outputs[key].name} and {destination.name}"
+                )
+            if destination.exists():
+                raise FileExistsError(f"Output file already exists: {destination}")
+            seen_outputs[key] = destination
+
+        _log("Processing images...")
+        processed_photos: List[Photo] = []
+        for source, name, label in planned_images:
+            destination = out_dir / name if template.include_loose_images else tmp / "processed" / name
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, destination)
+            processed_photos.append(Photo(label=label, image_path=destination))
+        report.photos = processed_photos
+
+        pdf_attachments: List[Path] = []
+        for source, destination in planned_attachments:
+            shutil.copy2(source, destination)
+            pdf_attachments.append(destination)
+        if pdf_attachments:
+            _log(f"Copied {len(pdf_attachments)} PDF attachment(s).")
 
         _log("Generating PDF...")
         build_pdf(pdf_path, report, template)
         _log(f"Saved PDF: {pdf_path.name}")
 
-        # Create output ZIP containing: generated report PDF, processed JPEGs, and any input PDF attachments.
-        out_zip_name = f"{safe_filename(report.building_id)}-{safe_filename(report.project_locatie_naam)}-{safe_filename(report.report_datetime)}-OUTPUT.zip"
-        out_zip_path = out_dir / out_zip_name
+        artifacts = [pdf_path]
+        if template.include_loose_images:
+            artifacts.extend(loose_image_paths)
+        artifacts.extend(pdf_attachments)
 
-        zip_files: List[Tuple[Path, str]] = []
-        zip_files.append((pdf_path, pdf_path.name))
-        for ph in processed_photos:
-            zip_files.append((ph.image_path, ph.image_path.name))
-        for p in pdf_attachments:
-            zip_files.append((p, p.name))
+        if out_zip_path is not None:
+            zip_files = [(path, path.name) for path in artifacts]
+            _log("Creating output ZIP...")
+            create_output_zip(out_zip_path, zip_files)
+            artifacts.append(out_zip_path)
+            _log(f"Saved ZIP: {out_zip_path.name}")
 
-        _log("Creating output ZIP...")
-        create_output_zip(out_zip_path, zip_files)
-        _log(f"Saved ZIP: {out_zip_path.name}")
-
-        return ProcessResult(report=report, pdf_path=pdf_path, written_images=written, output_zip_path=out_zip_path, copied_pdfs=len(pdf_attachments))
+        return ProcessResult(
+            report=report, pdf_path=pdf_path,
+            written_images=len(loose_image_paths) if template.include_loose_images else 0,
+            output_zip_path=out_zip_path, copied_pdfs=len(pdf_attachments),
+            generated_artifacts=artifacts,
+        )
 
 
 # =========================
 # GUI
 # =========================
 if tk is not None:
+    class TemplateManagerDialog(tk.Toplevel):
+        """Editor for export presentation templates (CSV import keys stay immutable)."""
+        def __init__(self, master: "App") -> None:
+            super().__init__(master)
+            self.app = master
+            self.title("Manage export templates")
+            self.geometry("900x650")
+            self.transient(master)
+            self.templates = list(master.export_templates)
+
+            left = ttk.Frame(self, padding=8); left.pack(side="left", fill="y")
+            ttk.Label(left, text="Templates").pack(anchor="w")
+            self.template_list = tk.Listbox(left, width=28, exportselection=False)
+            self.template_list.pack(fill="y", expand=True, pady=4)
+            self.template_list.bind("<<ListboxSelect>>", self._select)
+            for text, command in (("New", self._new), ("Duplicate", self._duplicate),
+                                  ("Rename", self._rename), ("Delete", self._delete)):
+                ttk.Button(left, text=text, command=command).pack(fill="x", pady=2)
+
+            right = ttk.Frame(self, padding=8); right.pack(side="left", fill="both", expand=True)
+            self.readonly_note = ttk.Label(right, foreground="#9b0000")
+            self.readonly_note.pack(anchor="w")
+            book = ttk.Notebook(right); book.pack(fill="both", expand=True, pady=5)
+            general = ttk.Frame(book, padding=8); sections = ttk.Frame(book, padding=8)
+            labels = ttk.Frame(book, padding=8); text_tab = ttk.Frame(book, padding=8)
+            book.add(general, text="Report & photos"); book.add(sections, text="Sections")
+            book.add(labels, text="CSV-backed fields / labels")
+            book.add(text_tab, text="Report text")
+
+            self.name_var = tk.StringVar(); self.title_var = tk.StringVar(); self.pattern_var = tk.StringVar()
+            self.fallback_var = tk.StringVar()
+            self.rows_var = tk.StringVar(); self.columns_var = tk.StringVar()
+            self.output_flag_vars = {
+                "include_photo_pages": tk.BooleanVar(),
+                "include_loose_images": tk.BooleanVar(),
+                "include_pdf_attachments": tk.BooleanVar(),
+                "create_output_zip": tk.BooleanVar(),
+            }
+            general.columnconfigure(1, weight=1)
+            fields = (("Template name", self.name_var), ("Report title", self.title_var),
+                      ("Filename pattern", self.pattern_var), ("Photo rows", self.rows_var),
+                      ("Photo columns", self.columns_var), ("Empty value fallback", self.fallback_var))
+            for row, (caption, variable) in enumerate(fields):
+                ttk.Label(general, text=caption).grid(row=row, column=0, sticky="w", padx=(0, 8), pady=3)
+                ttk.Entry(general, textvariable=variable).grid(row=row, column=1, sticky="ew", pady=3)
+            ttk.Label(general, text="Placeholders: {building_id}, {project_name}, {report_datetime}").grid(
+                row=6, column=1, sticky="w")
+            for offset, (key, caption) in enumerate((
+                ("include_photo_pages", "Include photo pages in report"),
+                ("include_loose_images", "Write loose processed images"),
+                ("include_pdf_attachments", "Copy imported PDF attachments"),
+                ("create_output_zip", "Create output ZIP"),
+            ), start=7):
+                ttk.Checkbutton(general, text=caption, variable=self.output_flag_vars[key]).grid(
+                    row=offset, column=1, sticky="w", pady=2)
+            self.color_vars = {key: tk.StringVar() for key in WERKLOGGER_EXPORT_TEMPLATE.colors}
+            for offset, (key, variable) in enumerate(self.color_vars.items(), start=11):
+                ttk.Label(general, text=f"{key.replace('_', ' ').title()} color").grid(row=offset, column=0, sticky="w", pady=3)
+                ttk.Entry(general, textvariable=variable, width=12).grid(row=offset, column=1, sticky="w", pady=3)
+
+            self.section_vars = {key: tk.BooleanVar() for key, _ in TEMPLATE_SECTIONS}
+            for row, (key, caption) in enumerate(TEMPLATE_SECTIONS):
+                ttk.Checkbutton(sections, text=caption, variable=self.section_vars[key]).grid(row=row, column=0, sticky="w")
+            ttk.Label(sections, text="Order").grid(row=0, column=1, sticky="w", padx=(30, 0))
+            self.order_list = tk.Listbox(sections, height=9, exportselection=False)
+            self.order_list.grid(row=1, column=1, rowspan=6, padx=(30, 4), sticky="nsew")
+            moves = ttk.Frame(sections); moves.grid(row=1, column=2, sticky="n")
+            ttk.Button(moves, text="Move up", command=lambda: self._move(-1)).pack(fill="x")
+            ttk.Button(moves, text="Move down", command=lambda: self._move(1)).pack(fill="x", pady=4)
+
+            ttk.Label(labels, text="Import/report field ID (fixed)").grid(row=0, column=0, sticky="w")
+            ttk.Label(labels, text="Display label (editable)").grid(row=0, column=1, sticky="w")
+            canvas = tk.Canvas(labels, highlightthickness=0); scroll = ttk.Scrollbar(labels, command=canvas.yview)
+            label_frame = ttk.Frame(canvas); canvas.create_window((0, 0), window=label_frame, anchor="nw")
+            canvas.configure(yscrollcommand=scroll.set); canvas.grid(row=1, column=0, columnspan=2, sticky="nsew")
+            scroll.grid(row=1, column=2, sticky="ns"); labels.rowconfigure(1, weight=1); labels.columnconfigure(1, weight=1)
+            label_frame.bind("<Configure>", lambda _e: canvas.configure(scrollregion=canvas.bbox("all")))
+            self.label_vars = {key: tk.StringVar() for key in WERKLOGGER_EXPORT_TEMPLATE.field_labels}
+            for row, (key, variable) in enumerate(self.label_vars.items()):
+                ttk.Label(label_frame, text=key, width=22).grid(row=row, column=0, sticky="w", pady=2)
+                ttk.Entry(label_frame, textvariable=variable, width=42).grid(row=row, column=1, sticky="ew", pady=2)
+
+            text_canvas = tk.Canvas(text_tab, highlightthickness=0)
+            text_scroll = ttk.Scrollbar(text_tab, command=text_canvas.yview)
+            text_frame = ttk.Frame(text_canvas)
+            text_canvas.create_window((0, 0), window=text_frame, anchor="nw")
+            text_canvas.configure(yscrollcommand=text_scroll.set)
+            text_canvas.pack(side="left", fill="both", expand=True)
+            text_scroll.pack(side="right", fill="y")
+            text_frame.bind("<Configure>", lambda _e: text_canvas.configure(scrollregion=text_canvas.bbox("all")))
+            self.branding_vars = {
+                key: tk.StringVar() for key in DEFAULT_TEMPLATE_BRANDING if key != "report_title"
+            }
+            for row, (key, variable) in enumerate(self.branding_vars.items()):
+                ttk.Label(text_frame, text=key.replace("_", " ").title(), width=32).grid(
+                    row=row, column=0, sticky="w", pady=2)
+                ttk.Entry(text_frame, textvariable=variable, width=55).grid(
+                    row=row, column=1, sticky="ew", pady=2)
+
+            footer = ttk.Frame(right); footer.pack(fill="x")
+            ttk.Button(footer, text="Save changes", command=self._save).pack(side="right")
+            ttk.Button(footer, text="Close", command=self.destroy).pack(side="right", padx=6)
+            self._refresh_list(0)
+
+        @staticmethod
+        def _hex(color: Tuple[float, float, float]) -> str:
+            return "#" + "".join(f"{max(0, min(255, round(component * 255))):02X}" for component in color)
+
+        def _refresh_list(self, index: int) -> None:
+            self.template_list.delete(0, "end")
+            for template in self.templates:
+                suffix = " (built-in)" if template.template_id == WERKLOGGER_EXPORT_TEMPLATE.template_id else ""
+                self.template_list.insert("end", template.display_name + suffix)
+            self.template_list.selection_set(max(0, min(index, len(self.templates) - 1))); self._load(index)
+
+        def _index(self) -> Optional[int]:
+            selection = self.template_list.curselection()
+            return selection[0] if selection else None
+
+        def _select(self, _event: Any = None) -> None:
+            index = self._index()
+            if index is not None: self._load(index)
+
+        def _load(self, index: int) -> None:
+            template = self.templates[index]; built_in = template.template_id == WERKLOGGER_EXPORT_TEMPLATE.template_id
+            self.readonly_note.config(text="Built-in compatibility template is read-only; duplicate it to customize." if built_in else "")
+            self.name_var.set(template.display_name); self.title_var.set(str(template.branding["report_title"]))
+            self.pattern_var.set(template.output_filename_pattern)
+            self.fallback_var.set(template.empty_value_fallback)
+            self.rows_var.set(str(template.photo_grid["rows"])); self.columns_var.set(str(template.photo_grid["columns"]))
+            for key, variable in self.output_flag_vars.items(): variable.set(getattr(template, key))
+            for key, variable in self.color_vars.items(): variable.set(self._hex(template.colors[key]))
+            for key, variable in self.section_vars.items(): variable.set(key in template.enabled_sections)
+            self.order_list.delete(0, "end")
+            for section in template.section_order: self.order_list.insert("end", section)
+            for key, variable in self.label_vars.items(): variable.set(template.field_labels[key])
+            for key, variable in self.branding_vars.items(): variable.set(template.branding[key])
+
+        def _new(self) -> None:
+            self._append_copy(WERKLOGGER_EXPORT_TEMPLATE, "New template")
+
+        def _duplicate(self) -> None:
+            index = self._index()
+            if index is not None: self._append_copy(self.templates[index], self.templates[index].display_name + " copy")
+
+        def _append_copy(self, source: ExportTemplate, name: str) -> None:
+            data = export_template_to_dict(source); data["template_id"] = "custom-" + uuid.uuid4().hex
+            data["display_name"] = name; self.templates.append(export_template_from_dict(data))
+            self._refresh_list(len(self.templates) - 1)
+
+        def _rename(self) -> None:
+            index = self._index()
+            if index is None: return
+            if index == 0:
+                messagebox.showinfo("Read-only", "Duplicate the built-in template before renaming it.", parent=self); return
+            name = self.name_var.get().strip()
+            if not name:
+                messagebox.showerror("Invalid name", "Enter the new name in Template name first.", parent=self); return
+            self._save()
+
+        def _delete(self) -> None:
+            index = self._index()
+            if index is None: return
+            if self.templates[index].template_id == WERKLOGGER_EXPORT_TEMPLATE.template_id:
+                messagebox.showinfo("Read-only", "The built-in compatibility template cannot be deleted.", parent=self); return
+            if messagebox.askyesno("Delete template", f"Delete {self.templates[index].display_name}?", parent=self):
+                del self.templates[index]; save_export_templates(self.templates); self.app.set_export_templates(self.templates)
+                self._refresh_list(max(0, index - 1))
+
+        def _move(self, delta: int) -> None:
+            selection = self.order_list.curselection()
+            if not selection: return
+            old = selection[0]; new = old + delta
+            if not 0 <= new < self.order_list.size(): return
+            value = self.order_list.get(old); self.order_list.delete(old); self.order_list.insert(new, value)
+            self.order_list.selection_set(new)
+
+        def _save(self) -> None:
+            index = self._index()
+            if index is None: return
+            current = self.templates[index]
+            if current.template_id == WERKLOGGER_EXPORT_TEMPLATE.template_id:
+                messagebox.showinfo("Read-only", "Duplicate the built-in template to customize it.", parent=self); return
+            order = list(self.order_list.get(0, "end"))
+            enabled = [key for key in order if self.section_vars[key].get()]
+            errors = validate_template_values(self.name_var.get(), self.title_var.get(), self.pattern_var.get(),
+                                              {k: v.get() for k, v in self.color_vars.items()}, enabled,
+                                              self.rows_var.get(), self.columns_var.get(),
+                                              current.page_settings, current.photo_grid)
+            if any(not variable.get().strip() for variable in self.label_vars.values()):
+                errors.append("All display labels are required.")
+            if any(not variable.get().strip() for variable in self.branding_vars.values()):
+                errors.append("All report text values are required.")
+            if "{title}" not in self.branding_vars["section_continuation_pattern"].get():
+                errors.append("Section continuation pattern must contain {title}.")
+            if any(t.display_name.casefold() == self.name_var.get().strip().casefold() and i != index
+                   for i, t in enumerate(self.templates)):
+                errors.append("Template names must be unique.")
+            if errors:
+                messagebox.showerror("Cannot save template", "\n".join(errors), parent=self); return
+            data = export_template_to_dict(current)
+            data.update(display_name=self.name_var.get().strip(), output_filename_pattern=self.pattern_var.get().strip(),
+                        empty_value_fallback=self.fallback_var.get(), enabled_sections=enabled, section_order=order)
+            data.update({key: variable.get() for key, variable in self.output_flag_vars.items()})
+            data["branding"]["report_title"] = self.title_var.get().strip()
+            data["branding"].update({key: variable.get().strip()
+                                     for key, variable in self.branding_vars.items()})
+            data["colors"] = {key: [int(value.get().strip()[i:i+2], 16) / 255 for i in (1, 3, 5)] for key, value in self.color_vars.items()}
+            data["photo_grid"].update(rows=int(self.rows_var.get()), columns=int(self.columns_var.get()))
+            data["field_labels"] = {key: variable.get().strip() for key, variable in self.label_vars.items()}
+            self.templates[index] = export_template_from_dict(data)
+            try: save_export_templates(self.templates)
+            except ExportTemplateConfigurationError as exc:
+                messagebox.showerror("Cannot save template", str(exc), parent=self); return
+            self.app.set_export_templates(self.templates, self.templates[index].template_id)
+            self._refresh_list(index)
+            messagebox.showinfo("Template saved", "The export template is ready to use.", parent=self)
+
     class App(tk.Tk):
         def __init__(self) -> None:
             super().__init__()
@@ -1603,6 +2217,15 @@ if tk is not None:
     
             self.zip_path: Optional[Path] = None
             self.out_dir: Optional[Path] = None
+            try:
+                self.export_templates = load_export_templates()
+            except ExportTemplateConfigurationError as exc:
+                if exc.recovered_templates is not None:
+                    self.export_templates = exc.recovered_templates
+                    messagebox.showwarning("Export templates recovered", str(exc), parent=self)
+                else:
+                    self.export_templates = [WERKLOGGER_EXPORT_TEMPLATE]
+                    messagebox.showerror("Export-template configuration error", str(exc), parent=self)
     
             frm = tk.Frame(self)
             frm.pack(fill="x", padx=10, pady=10)
@@ -1619,35 +2242,35 @@ if tk is not None:
             proj_row.pack(fill="x", pady=(10, 0))
             tk.Label(proj_row, text="Project/Locatie Naam:", width=22, anchor="w").pack(side="left")
 
-            self.config = load_projects()
-            self.projects = self.config.projects
-            self.project_by_name = {p.display_name: p for p in self.projects}
+            try:
+                self.projects = load_projects()
+            except ProjectConfigurationError as exc:
+                self.projects = list(DEFAULT_PROJECT_RECORDS)
+                messagebox.showerror("Project configuration error", str(exc), parent=self)
             self.project_var = tk.StringVar(value="")
             self.cmb_project = ttk.Combobox(
                 proj_row,
                 textvariable=self.project_var,
-                values=([''] + [p.display_name for p in self.projects]),
+                values=([''] + [project.display_name for project in self.projects]),
                 state="readonly",
                 width=32,
             )
             self.cmb_project.pack(side="left", padx=(0, 10))
             self.cmb_project.bind("<<ComboboxSelected>>", self.on_project_selected)
 
-            tk.Label(proj_row, text="Export template:", anchor="w").pack(side="left")
-            self.template_by_name = {t.display_name: t for t in self.config.templates}
-            self.template_var = tk.StringVar(value=self.config.templates[0].display_name)
-            self.cmb_template = ttk.Combobox(
-                proj_row,
-                textvariable=self.template_var,
-                values=[t.display_name for t in self.config.templates],
-                state="readonly",
-                width=24,
-            )
-            self.cmb_template.pack(side="left", padx=(6, 10))
-
             self.new_project_var = tk.StringVar()
             tk.Entry(proj_row, textvariable=self.new_project_var, width=26).pack(side="left")
             tk.Button(proj_row, text="Add project", command=self.add_project).pack(side="left", padx=(8, 0))
+
+            template_row = tk.Frame(frm); template_row.pack(fill="x", pady=(8, 0))
+            tk.Label(template_row, text="Export template:", width=22, anchor="w").pack(side="left")
+            self.template_var = tk.StringVar()
+            self.cmb_template = ttk.Combobox(template_row, textvariable=self.template_var, state="readonly", width=32)
+            self.cmb_template.pack(side="left", padx=(0, 10))
+            tk.Button(template_row, text="Save as project default",
+                      command=self.save_project_default).pack(side="left", padx=(0, 10))
+            tk.Button(template_row, text="Manage templates...", command=self.manage_templates).pack(side="left")
+            self.set_export_templates(self.export_templates)
     
             btns = tk.Frame(frm)
             btns.pack(fill="x", pady=(10, 0))
@@ -1678,26 +2301,74 @@ if tk is not None:
             name = re.sub(r"_+", "_", name).strip("._ ")
             if not name:
                 return
-            if name not in self.project_by_name:
-                selected_template = self.template_by_name[self.template_var.get()]
-                project = ProjectRecord(_stable_project_id(name), name, selected_template.id)
-                self.projects.append(project)
-                self.project_by_name[name] = project
-                self.cmb_project["values"] = ([""] + [p.display_name for p in self.projects])
-                save_projects(self.config)
+            existing = next((project for project in self.projects if project.display_name == name), None)
+            if existing is None:
+                existing = ProjectRecord("project-" + uuid.uuid4().hex, name,
+                                         WERKLOGGER_EXPORT_TEMPLATE.template_id)
+                self.projects.append(existing)
+                self.cmb_project["values"] = ([""] + [project.display_name for project in self.projects])
+                try:
+                    save_projects(self.projects)
+                except ProjectConfigurationError as exc:
+                    self.projects.remove(existing)
+                    self.cmb_project["values"] = ([""] + [project.display_name for project in self.projects])
+                    messagebox.showerror("Project configuration error", str(exc), parent=self)
+                    self.log(f"Could not save project: {exc}")
+                    return
             self.project_var.set(name)
+            self.on_project_selected()
             self.new_project_var.set("")
             self.log(f"Project added/selected: {name}")
 
-        def on_project_selected(self, _event: object = None) -> None:
-            """Apply a project's default without locking the per-export choice."""
-            project = self.project_by_name.get(self.project_var.get())
-            template_id = project.default_template_id if project else None
-            if not template_id:
-                template_id = DEFAULT_EXPORT_TEMPLATE_ID
-            template = next((t for t in self.config.templates if t.id == template_id), None)
-            if template:
-                self.template_var.set(template.display_name)
+        def selected_project(self) -> Optional[ProjectRecord]:
+            return next((project for project in self.projects
+                         if project.display_name == self.project_var.get()), None)
+
+        def on_project_selected(self, _event: Any = None) -> None:
+            """Apply the selected project's default; later template choices remain one-off."""
+            project = self.selected_project()
+            if project is None:
+                return
+            template = project_default_template(project, self.export_templates)
+            self.template_var.set(template.display_name)
+            if template.template_id != project.default_template_id:
+                self.log(f"Project {project.display_name}'s default template is missing; "
+                         "using the built-in template. Save a new default to repair it.")
+
+        def save_project_default(self) -> None:
+            project = self.selected_project()
+            if project is None:
+                messagebox.showinfo("Select project", "Select a project first.", parent=self)
+                return
+            updated = ProjectRecord(project.project_id, project.display_name,
+                                    self.selected_template().template_id)
+            index = self.projects.index(project)
+            self.projects[index] = updated
+            try:
+                save_projects(self.projects)
+            except ProjectConfigurationError as exc:
+                self.projects[index] = project
+                messagebox.showerror("Project configuration error", str(exc), parent=self)
+                return
+            self.log(f"Saved {self.selected_template().display_name} as the default for {project.display_name}.")
+
+        def set_export_templates(self, templates: List[ExportTemplate], selected_id: Optional[str] = None) -> None:
+            """Refresh template choices immediately after a management operation."""
+            old_id = selected_id
+            if old_id is None and hasattr(self, "cmb_template"):
+                current = self.template_var.get()
+                old_id = next((t.template_id for t in self.export_templates if t.display_name == current), None)
+            self.export_templates = list(templates)
+            self.cmb_template["values"] = [t.display_name for t in self.export_templates]
+            selected = next((t for t in self.export_templates if t.template_id == old_id), self.export_templates[0])
+            self.template_var.set(selected.display_name)
+
+        def manage_templates(self) -> None:
+            TemplateManagerDialog(self)
+
+        def selected_template(self) -> ExportTemplate:
+            return next((t for t in self.export_templates if t.display_name == self.template_var.get()),
+                        WERKLOGGER_EXPORT_TEMPLATE)
 
         def pick_zip(self) -> None:
             path = filedialog.askopenfilename(title="Select input ZIP", filetypes=[("ZIP files", "*.zip")])
@@ -1726,16 +2397,11 @@ if tk is not None:
             self.btn_run.config(state="disabled")
             try:
                 self.log("Starting processing...")
-                template = self.template_by_name[self.template_var.get()]
-                res = process_zip_to_folder_and_pdf(
-                    self.zip_path,
-                    self.out_dir,
-                    project_override=self.project_var.get(),
-                    log=self.log,
-                    template=resolve_export_template(template_id=template.id),
-                )
+                res = process_zip_to_folder_and_pdf(self.zip_path, self.out_dir, project_override=self.project_var.get(),
+                                                    log=self.log, template=self.selected_template())
                 self.log(f"Done. Images written: {res.written_images}")
-                messagebox.showinfo("Success", f"Finished.\nImages: {res.written_images}\nPDF: {res.pdf_path.name}")
+                files = "\n".join(f"• {path.name}" for path in res.generated_artifacts)
+                messagebox.showinfo("Success", f"Finished. Files produced:\n{files}")
             except Exception as e:
                 self.log(f"ERROR: {e}")
                 messagebox.showerror("Error", str(e))
@@ -1753,23 +2419,51 @@ def main() -> None:
     ap.add_argument("--out", dest="out_dir", help="Output folder path")
     ap.add_argument("--project", dest="project", help="Override Project/Locatie Naam")
     ap.add_argument(
-        "--export-template",
-        default=DEFAULT_EXPORT_TEMPLATE_ID,
-        choices=[template.id for template in DEFAULT_TEMPLATES],
-        help="Stable export template ID (default: %(default)s)",
+        "--export-template", metavar="TEMPLATE_ID",
+        help="Use the persisted export template with this stable ID",
+    )
+    ap.add_argument(
+        "--list-export-templates", action="store_true",
+        help="List available export-template IDs and display names, then exit",
     )
     args = ap.parse_args()
 
-    if args.zip_path and args.out_dir:
-        res = process_zip_to_folder_and_pdf(
-            Path(args.zip_path),
-            Path(args.out_dir),
-            project_override=args.project,
-            log=print,
-            template=resolve_export_template(template_id=args.export_template),
-        )
-        print(f"PDF: {res.pdf_path}")
+    if args.list_export_templates:
+        try:
+            templates = load_export_templates()
+        except ExportTemplateConfigurationError as exc:
+            ap.error(str(exc))
+        for template in templates:
+            print(f"{template.template_id}\t{template.display_name}")
         return
+
+    if args.zip_path and args.out_dir:
+        template = None
+        if args.export_template is not None:
+            try:
+                templates = load_export_templates()
+            except ExportTemplateConfigurationError as exc:
+                ap.error(str(exc))
+            template = next(
+                (item for item in templates if item.template_id == args.export_template),
+                None,
+            )
+            if template is None:
+                ap.error(
+                    f"export template ID {args.export_template!r} does not exist; "
+                    "use --list-export-templates to see available IDs"
+                )
+        res = process_zip_to_folder_and_pdf(
+            Path(args.zip_path), Path(args.out_dir), project_override=args.project,
+            log=print, template=template,
+        )
+        print("Files produced:")
+        for artifact in res.generated_artifacts:
+            print(artifact)
+        return
+
+    if args.export_template is not None:
+        ap.error("--export-template requires both --zip and --out")
 
     # default to GUI
     if tk is None:

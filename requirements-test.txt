@@ -1,0 +1,2 @@
+-r requirements_v22.txt
+pytest==8.4.2
