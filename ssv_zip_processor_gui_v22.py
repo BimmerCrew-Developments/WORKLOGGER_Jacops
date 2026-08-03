@@ -1045,8 +1045,8 @@ def read_first_csv_values(csv_path: Path, header_idx: int,
             next(handle)
         reader = csv.reader(handle)
         headers = [value.strip() for value in next(reader)[:column_count]]
-        for row_values in reader:
-            row = dict(zip(headers, row_values[:len(headers)]))
+        for values in reader:
+            row = dict(zip(headers, values[:len(headers)]))
             for key, value in row.items():
                 cleaned = (value or "").strip()
                 if key and cleaned:
