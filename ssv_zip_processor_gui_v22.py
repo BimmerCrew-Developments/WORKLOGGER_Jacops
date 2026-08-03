@@ -1039,19 +1039,19 @@ def inspect_csv_headers(csv_path: Path) -> Tuple[str, ...]:
 def read_first_csv_values(csv_path: Path, header_idx: int,
                           column_count: Optional[int] = None) -> Dict[str, str]:
     """Return the first non-empty value per source column for direct PDF mappings."""
-    first_values_by_column: Dict[str, str] = {}
+    first_values: Dict[str, str] = {}
     with csv_path.open("r", encoding="utf-8-sig", newline="") as handle:
         for _ in range(header_idx):
             next(handle)
         reader = csv.reader(handle)
         headers = [value.strip() for value in next(reader)[:column_count]]
-        for row_values in reader:
-            row = dict(zip(headers, row_values[:len(headers)]))
+        for values in reader:
+            row = dict(zip(headers, values[:len(headers)]))
             for key, value in row.items():
                 cleaned = (value or "").strip()
                 if key and cleaned:
-                    first_values_by_column.setdefault(key.strip(), cleaned)
-    return first_values_by_column
+                    first_values.setdefault(key.strip(), cleaned)
+    return first_values
 
 
 def load_audit_csv(csv_path: Path, column_mapping: Optional[Mapping[str, str]] = None,
