@@ -371,9 +371,13 @@ def export_template_from_dict(data: Mapping[str, Any]) -> ExportTemplate:
     branding = {**DEFAULT_TEMPLATE_BRANDING, **dict(data["branding"])}
     if branding.get("photo_title") == "Foto's":
         branding["photo_title"] = DEFAULT_TEMPLATE_BRANDING["photo_title"]
+    page_settings = dict(data["page_settings"])
+    # JSON has no tuple type, so restore ReportLab's pagesize pair after a
+    # template has passed through persistent storage.
+    page_settings["pagesize"] = tuple(page_settings["pagesize"])
     template = ExportTemplate(
         template_id=str(data["template_id"]), display_name=str(data["display_name"]),
-        page_settings=dict(data["page_settings"]), branding=branding,
+        page_settings=page_settings, branding=branding,
         colors={key: tuple(value) for key, value in dict(data["colors"]).items()},
         enabled_sections=tuple(data["enabled_sections"]), section_order=tuple(data["section_order"]),
         section_fields={str(k): tuple(v) for k, v in dict(data.get("section_fields", SECTION_FIELD_KEYS)).items()},
