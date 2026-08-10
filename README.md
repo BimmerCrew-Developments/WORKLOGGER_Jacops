@@ -66,13 +66,21 @@ You can still use `run_worklogger.command` on macOS if you already have Python i
 ## Create a CSV-based export template
 
 Open **Manage templates...** and choose **New**. Select an example CSV export when
-prompted. Worklogger stores only its column names, not the example data. In the
+prompted. Worklogger stores its column names and the row IDs/labels needed to
+identify questions, but not the example answers or media. In the
 **CSV column mapping** tab you can then:
 
 - map renamed CSV columns to the standard import purposes (ID, type, label,
   answer, media, and so on); and
 - optionally map a CSV column directly to each PDF field, such as Building ID,
   project name, address, or report date.
+
+The **Questions** tab is generated from every labelled CSV row after the selected
+header row. For each question, select **Primary**, **Secondary**, **Media**, or any
+combination. The row's Label becomes the question heading in the PDF, selected
+text values are printed below it, and selected media appears on the photo pages
+under the same heading. These choices are saved with the template and matched to
+future ZIP exports by row ID, with the label used as a fallback.
 
 The other tabs continue to control the shared report layout, section order,
 labels, text, colors, photo grid, and output files. This allows templates to use

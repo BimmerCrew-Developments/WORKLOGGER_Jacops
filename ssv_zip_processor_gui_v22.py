@@ -78,6 +78,7 @@ class AuditRow:
 
 @dataclass
 class MediaRow:
+    row_id: str
     label: str
     media_ids: List[str]
 
@@ -86,6 +87,14 @@ class MediaRow:
 class Photo:
     label: str
     image_path: Path  # processed output path
+
+
+@dataclass
+class ReportQuestion:
+    """A configured CSV question and the values selected for the report."""
+
+    label: str
+    values: List[str]
 
 
 @dataclass
@@ -111,6 +120,7 @@ class ReportRow:
     gebruikte_materialen_lines: List[str]
     post_afmeldingen_lines: List[str]
     photos: List[Photo]
+    questions: List[ReportQuestion] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -176,14 +186,17 @@ class ExportTemplate:
     create_output_zip: bool = True
     empty_value_fallback: str = "Niet ingevuld"
     layout: Mapping[str, Any] = field(default_factory=dict)
-    # The uploaded CSV is used as a schema sample only; no customer rows are
-    # persisted.  These mappings let otherwise identical exports rename their
-    # structural columns and feed PDF fields directly from a chosen column.
+    # The uploaded CSV supplies its schema plus question row IDs and labels;
+    # answers and media are never persisted. These mappings let otherwise
+    # identical exports rename columns and feed PDF fields directly.
     csv_headers: Tuple[str, ...] = ()
     csv_column_mapping: Mapping[str, str] = field(default_factory=dict)
     pdf_field_columns: Mapping[str, str] = field(default_factory=dict)
     csv_header_row: Optional[int] = None
     csv_column_count: Optional[int] = None
+    # One entry per sample data row. ``values`` contains any combination of the
+    # canonical Primary, Secondary and Media roles selected in the editor.
+    question_mappings: Tuple[Mapping[str, Any], ...] = ()
 
 
 # All report copy which is not sourced from the CSV lives here.  Keeping these
@@ -378,6 +391,7 @@ def export_template_to_dict(template: ExportTemplate) -> Dict[str, Any]:
         "pdf_field_columns": dict(template.pdf_field_columns),
         "csv_header_row": template.csv_header_row,
         "csv_column_count": template.csv_column_count,
+        "question_mappings": [dict(item) for item in template.question_mappings],
     }
 
 
@@ -415,6 +429,11 @@ def export_template_from_dict(data: Mapping[str, Any]) -> ExportTemplate:
                         if data.get("csv_header_row") is not None else None),
         csv_column_count=(int(data["csv_column_count"])
                           if data.get("csv_column_count") is not None else None),
+        question_mappings=tuple({
+            "row_id": str(item.get("row_id", "")),
+            "label": str(item.get("label", "")),
+            "values": tuple(str(value) for value in item.get("values", ())),
+        } for item in data.get("question_mappings", ())),
     )
     if resolve_export_template(template) is not template:
         raise ValueError("Invalid export template")
@@ -600,6 +619,13 @@ def resolve_export_template(template: Optional[ExportTemplate]) -> ExportTemplat
             and set(template.pdf_field_columns).issubset(PDF_COLUMN_FIELDS)
             and all(value in template.csv_headers for value in template.csv_column_mapping.values())
             and all(value in template.csv_headers for value in template.pdf_field_columns.values())
+            and all(
+                isinstance(item, Mapping)
+                and bool(str(item.get("label", "")).strip())
+                and bool(set(item.get("values", ())))
+                and set(item.get("values", ())).issubset({"Primary", "Secondary", "Media"})
+                for item in template.question_mappings
+            )
             and (template.csv_header_row is None
                  or type(template.csv_header_row) is int and template.csv_header_row >= 0)
             and (template.csv_column_count is None
@@ -1007,17 +1033,42 @@ def find_header_row(csv_path: Path, column_mapping: Optional[Mapping[str, str]] 
     raise ValueError("Could not find CSV header row with required columns.")
 
 
-def read_csv_preview(csv_path: Path, limit: int = 100) -> List[Tuple[str, ...]]:
+def read_csv_preview(csv_path: Path, limit: Optional[int] = None) -> List[Tuple[str, ...]]:
     """Read CSV rows for the schema preview without interpreting a header."""
     rows: List[Tuple[str, ...]] = []
     with csv_path.open("r", encoding="utf-8-sig", newline="") as handle:
         for row in csv.reader(handle):
             rows.append(tuple(cell.strip() for cell in row))
-            if len(rows) >= limit:
+            if limit is not None and len(rows) >= limit:
                 break
     if not rows:
         raise ValueError("The selected CSV is empty.")
     return rows
+
+
+def question_mappings_from_preview(
+    rows: List[Tuple[str, ...]], header_row: int, column_count: int,
+    column_mapping: Optional[Mapping[str, str]] = None,
+) -> Tuple[Mapping[str, Any], ...]:
+    """Create selectable question definitions from every labelled sample row."""
+    headers = tuple(rows[header_row][:column_count])
+    mapping = dict(column_mapping or {})
+    label_column = mapping.get("Label", "Label")
+    id_column = mapping.get("ID", "ID")
+    if label_column not in headers:
+        return ()
+    questions: List[Mapping[str, Any]] = []
+    seen: Set[Tuple[str, str]] = set()
+    for values in rows[header_row + 1:]:
+        raw = dict(zip(headers, values[:column_count]))
+        label = (raw.get(label_column) or "").strip()
+        row_id = (raw.get(id_column) or "").strip()
+        key = (row_id, label.casefold())
+        if not label or key in seen:
+            continue
+        seen.add(key)
+        questions.append({"row_id": row_id, "label": label, "values": ("Primary",)})
+    return tuple(questions)
 
 
 def inspect_csv_headers(csv_path: Path) -> Tuple[str, ...]:
@@ -1117,15 +1168,14 @@ def load_audit_csv(csv_path: Path, column_mapping: Optional[Mapping[str, str]] =
         if val:
             fields.setdefault(label, val)
 
-    # Media rows (type=media)
+    # Any question can carry media; the Type column is not a reliable gate in
+    # all SafetyAuditor templates.
     media_rows: List[MediaRow] = []
     for r in audit_rows:
-        if (r.row_type or "").strip().casefold() != "media":
-            continue
         label = (r.label or "").strip() or "UNLABELED"
         media_ids = parse_media_ids(r.media, r.note)
         if media_ids:
-            media_rows.append(MediaRow(label=label, media_ids=media_ids))
+            media_rows.append(MediaRow(row_id=r.row_id, label=label, media_ids=media_ids))
 
     return meta, fields, media_rows, audit_rows
 
@@ -1662,6 +1712,26 @@ def _render_post_registrations_section(ctx: _Page1RenderContext, y: float) -> fl
     return _render_bullet_section(ctx, y, "post_registrations")
 
 
+def _render_configured_questions(ctx: _Page1RenderContext, y: float) -> float:
+    """Render selected CSV rows as question-titled paragraphs."""
+    dy = ctx.template.layout["line_spacing"]
+    for question in ctx.report.questions:
+        wrapped_values: List[str] = []
+        for value in question.values:
+            wrapped_values.extend(_wrap_lines(value, 105) or [ctx.template.empty_value_fallback])
+        required = dy * (2 + len(wrapped_values))
+        y = ctx.ensure_space(y, required)
+        ctx.canvas.setFont("Helvetica-Bold", 11)
+        ctx.canvas.drawString(ctx.template.layout["left"], y, question.label)
+        y -= dy
+        ctx.canvas.setFont("Helvetica", 10)
+        for line in wrapped_values:
+            ctx.canvas.drawString(ctx.template.layout["left"], y, line)
+            y -= dy
+        y -= 6
+    return y
+
+
 PAGE1_SECTION_RENDERERS: Mapping[str, Callable[[_Page1RenderContext, float], float]] = {
     "address": _render_address_section,
     "lmra": _render_lmra_section,
@@ -1697,6 +1767,8 @@ def render_page1(c: Canvas, report: ReportRow, template: Optional[ExportTemplate
         if compatibility_layout and ctx.page_number == 1:
             y = compatibility_y[section]
         y = PAGE1_SECTION_RENDERERS[section](ctx, y)
+    if report.questions:
+        _render_configured_questions(ctx, y)
 
 
 
@@ -1836,6 +1908,8 @@ def build_pdf(out_pdf_path: Path, report: ReportRow, template: Optional[ExportTe
     template = resolve_export_template(template)
     c = Canvas(str(out_pdf_path), pagesize=template.page_settings["pagesize"])
     non_photo_sections = [s for s in template.section_order if s != "photos" and s in template.enabled_sections]
+    if report.questions and not non_photo_sections:
+        non_photo_sections = ["configured_questions"]
     if non_photo_sections:
         render_page1(c, report, template)
     if template.include_photo_pages and "photos" in template.enabled_sections and report.photos:
@@ -1912,6 +1986,35 @@ def process_zip_to_folder_and_pdf(zip_path: Path, out_dir: Path, project_overrid
             post_afmeldingen_lines=post_afmeldingen,
             photos=[],
         )
+        selected_media_keys: Set[Tuple[str, str]] = set()
+        for configured in template.question_mappings:
+            configured_id = str(configured.get("row_id", "")).strip()
+            configured_label = str(configured.get("label", "")).strip()
+            row = next((candidate for candidate in audit_rows
+                        if configured_id and candidate.row_id == configured_id), None)
+            if row is None:
+                row = next((candidate for candidate in audit_rows
+                            if candidate.label.casefold() == configured_label.casefold()), None)
+            if row is None:
+                continue
+            choices = set(configured.get("values", ()))
+            values: List[str] = []
+            for role, raw_value in (("Primary", row.primary), ("Secondary", row.secondary)):
+                if role in choices and raw_value.strip():
+                    values.append(parse_list_value(raw_value))
+            if "Media" in choices:
+                selected_media_keys.add((row.row_id, row.label.casefold()))
+                media_count = len(parse_media_ids(row.media, row.note))
+                if media_count:
+                    values.append(f"{media_count} media file(s) — see photo pages")
+            report.questions.append(ReportQuestion(
+                label=row.label or configured_label,
+                values=values or [template.empty_value_fallback],
+            ))
+
+        if template.question_mappings:
+            media_rows = [row for row in media_rows
+                          if (row.row_id, row.label.casefold()) in selected_media_keys]
         report_attributes = {
             "report_datetime": "report_datetime", "subcontractor": "naam_onderaannemer",
             "project_name": "project_locatie_naam", "building_id": "building_id",
@@ -2151,9 +2254,11 @@ if tk is not None:
             general = ttk.Frame(book, padding=8); sections = ttk.Frame(book, padding=8)
             labels = ttk.Frame(book, padding=8); text_tab = ttk.Frame(book, padding=8)
             csv_tab = ttk.Frame(book, padding=8)
+            questions_tab = ttk.Frame(book, padding=8)
             book.add(general, text="Report & photos"); book.add(sections, text="Sections")
             book.add(labels, text="CSV-backed fields / labels")
             book.add(csv_tab, text="CSV column mapping")
+            book.add(questions_tab, text="Questions")
             book.add(text_tab, text="Report text")
 
             self.name_var = tk.StringVar(); self.title_var = tk.StringVar(); self.pattern_var = tk.StringVar()
@@ -2231,6 +2336,23 @@ if tk is not None:
                 box.grid(row=row, column=3, sticky="ew", pady=2); self.pdf_column_boxes[key] = box
             csv_tab.columnconfigure(3, weight=1)
 
+            ttk.Label(
+                questions_tab,
+                text="Every labelled row after the selected table header is a question. "
+                     "Choose which values are printed for each question; Media adds its images to the photo pages.",
+                wraplength=650,
+            ).pack(fill="x", pady=(0, 8))
+            question_canvas = tk.Canvas(questions_tab, highlightthickness=0)
+            question_scroll = ttk.Scrollbar(questions_tab, command=question_canvas.yview)
+            self.question_frame = ttk.Frame(question_canvas)
+            question_canvas.create_window((0, 0), window=self.question_frame, anchor="nw")
+            question_canvas.configure(yscrollcommand=question_scroll.set)
+            question_canvas.pack(side="left", fill="both", expand=True)
+            question_scroll.pack(side="right", fill="y")
+            self.question_frame.bind(
+                "<Configure>", lambda _e: question_canvas.configure(scrollregion=question_canvas.bbox("all")))
+            self.question_value_vars: List[Tuple[Mapping[str, Any], Dict[str, tk.BooleanVar]]] = []
+
             text_canvas = tk.Canvas(text_tab, highlightthickness=0)
             text_scroll = ttk.Scrollbar(text_tab, command=text_canvas.yview)
             text_frame = ttk.Frame(text_canvas)
@@ -2295,6 +2417,29 @@ if tk is not None:
             for key, variable in self.pdf_column_vars.items():
                 self.pdf_column_boxes[key]["values"] = choices
                 variable.set(template.pdf_field_columns.get(key, ""))
+            self._load_questions(template)
+
+        def _load_questions(self, template: ExportTemplate) -> None:
+            for child in self.question_frame.winfo_children():
+                child.destroy()
+            self.question_value_vars = []
+            if not template.question_mappings:
+                ttk.Label(self.question_frame, text="No labelled question rows were found in the sample CSV.").grid(
+                    row=0, column=0, sticky="w")
+                return
+            for column, caption in enumerate(("Question", "Primary", "Secondary", "Media")):
+                ttk.Label(self.question_frame, text=caption).grid(
+                    row=0, column=column, sticky="w", padx=(0, 14), pady=(0, 5))
+            for row_number, configured in enumerate(template.question_mappings, start=1):
+                ttk.Label(self.question_frame, text=str(configured["label"]), wraplength=430).grid(
+                    row=row_number, column=0, sticky="w", padx=(0, 14), pady=3)
+                selected = set(configured.get("values", ()))
+                variables = {role: tk.BooleanVar(value=role in selected)
+                             for role in ("Primary", "Secondary", "Media")}
+                for column, role in enumerate(("Primary", "Secondary", "Media"), start=1):
+                    ttk.Checkbutton(self.question_frame, variable=variables[role]).grid(
+                        row=row_number, column=column, sticky="w", padx=(0, 14))
+                self.question_value_vars.append((configured, variables))
 
         def _new(self) -> None:
             path = filedialog.askopenfilename(
@@ -2316,6 +2461,8 @@ if tk is not None:
             data["csv_column_mapping"] = {
                 role: folded[role.casefold()] for role in CSV_COLUMN_ROLES if role.casefold() in folded
             }
+            data["question_mappings"] = [dict(item) for item in question_mappings_from_preview(
+                preview.rows, header_row, column_count, data["csv_column_mapping"])]
             self.templates.append(export_template_from_dict(data))
             self._refresh_list(len(self.templates) - 1)
 
@@ -2382,6 +2529,9 @@ if tk is not None:
                                  if self.csv_role_vars[role].get() not in available and role not in available]
                 if missing_roles:
                     errors.append("Map the required CSV purposes: " + ", ".join(missing_roles) + ".")
+            if any(not any(variable.get() for variable in variables.values())
+                   for _configured, variables in self.question_value_vars):
+                errors.append("Select at least one value for every configured question.")
             if errors:
                 messagebox.showerror("Cannot save template", "\n".join(errors), parent=self); return
             data = export_template_to_dict(current)
@@ -2398,6 +2548,11 @@ if tk is not None:
                                           if variable.get()}
             data["pdf_field_columns"] = {key: variable.get() for key, variable in self.pdf_column_vars.items()
                                          if variable.get()}
+            data["question_mappings"] = [{
+                "row_id": configured.get("row_id", ""),
+                "label": configured["label"],
+                "values": [role for role, variable in variables.items() if variable.get()],
+            } for configured, variables in self.question_value_vars]
             self.templates[index] = export_template_from_dict(data)
             try: save_export_templates(self.templates)
             except ExportTemplateConfigurationError as exc:

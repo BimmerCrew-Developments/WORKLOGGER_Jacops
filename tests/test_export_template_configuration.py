@@ -136,6 +136,10 @@ def test_uploaded_csv_schema_and_column_mappings_round_trip():
                             "Primary": "Answer", "Media": "Files"},
         pdf_field_columns={"building_id": "Record", "project_name": "Answer"},
         csv_header_row=2, csv_column_count=5,
+        question_mappings=(
+            {"row_id": "question-1", "label": "Was the site safe?",
+             "values": ("Primary", "Media")},
+        ),
     )
 
     restored = app.export_template_from_dict(app.export_template_to_dict(original))
@@ -145,6 +149,24 @@ def test_uploaded_csv_schema_and_column_mappings_round_trip():
     assert restored.pdf_field_columns == original.pdf_field_columns
     assert restored.csv_header_row == 2
     assert restored.csv_column_count == 5
+    assert restored.question_mappings == original.question_mappings
+
+
+def test_question_mappings_are_built_from_every_labelled_row_after_header():
+    rows = [
+        ("export metadata",),
+        ("ID", "Type", "Label", "Primary", "Secondary", "Media"),
+        ("q1", "text", "First question", "yes", "details", ""),
+        ("q2", "media", "Photo evidence", "", "", "photo-1"),
+        ("", "", "", "", "", ""),
+    ]
+
+    mappings = app.question_mappings_from_preview(rows, 1, 6)
+
+    assert [(item["row_id"], item["label"]) for item in mappings] == [
+        ("q1", "First question"), ("q2", "Photo evidence"),
+    ]
+    assert all(item["values"] == ("Primary",) for item in mappings)
 
 
 def test_configured_csv_range_is_used_for_parsing_and_direct_values(tmp_path):
