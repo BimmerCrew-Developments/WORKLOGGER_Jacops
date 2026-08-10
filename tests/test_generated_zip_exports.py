@@ -57,6 +57,26 @@ def test_section_enablement_and_order_are_visible_in_generated_pdf(tmp_path, aud
     assert "Foto's:" not in text
 
 
+def test_configured_csv_questions_render_selected_values_and_media(tmp_path, audit_zip):
+    template = _template(
+        question_mappings=(
+            {"row_id": "2", "label": "Project/Locatie Naam", "values": ("Primary",)},
+            {"row_id": "4", "label": "Adres", "values": ("Secondary",)},
+            {"row_id": "14", "label": "Inspectiefoto", "values": ("Media",)},
+        ),
+        create_output_zip=False,
+    )
+
+    result = app.process_zip_to_folder_and_pdf(audit_zip, tmp_path / "questions", template=template)
+    text = pdf_text(result.pdf_path)
+
+    assert "Project/Locatie Naam\nFixture Project" in text
+    assert "Adres\nTeststraat 42" in text
+    assert "2 media file(s)" in text
+    assert "Inspectiefoto (2)" in text
+    assert result.written_images == 2
+
+
 def test_output_flags_disable_optional_artifacts(tmp_path, audit_zip):
     template = _template(
         include_photo_pages=False,
